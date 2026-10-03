@@ -220,10 +220,22 @@ node scripts/cost-analysis.mjs [hindsightUrl] [bankId]
 ```yaml
 environment:
   HINDSIGHT_API_LLM_PROVIDER: openai
-  HINDSIGHT_API_LLM_BASE_URL: http://host.docker.internal:18999/v1
+  # ⚠️ 填**跑桥那台机器的局域网 IP**
+  HINDSIGHT_API_LLM_BASE_URL: http://192.168.31.21:18999/v1
   HINDSIGHT_API_LLM_API_KEY: local
   HINDSIGHT_API_LLM_MODEL: space-bunny-free
 ```
+
+⚠️ **`BASE_URL` 里的地址取决于桥和 Hindsight 是不是同一台机器**：
+
+- **不同机器**（常见，比如桥在电脑、Hindsight 在 NAS）→ 桥要 `HOST=0.0.0.0`，
+  `BASE_URL` 填**桥那台机器的局域网 IP**。
+- **同一台机器** → 桥保持默认回环，加 `extra_hosts: ["host.docker.internal:host-gateway"]`，
+  `BASE_URL` 用 `http://host.docker.internal:18999/v1`。
+
+**`host.docker.internal` 在「不同机器」时是错的**——它指向 Hindsight 所在那台机器的
+宿主机，而不是你跑桥的电脑。这一步实测过两种绑定方式的差别，见
+[docs/hindsight-setup.md](docs/hindsight-setup.md#让-nas-容器能访问--先看清你的拓扑)。
 
 另外记得关掉思考并放宽超时——思考 token 与正文抢同一份额度，而记忆提取只要结论：
 

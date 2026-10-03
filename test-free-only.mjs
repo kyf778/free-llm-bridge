@@ -411,6 +411,30 @@ asyncTest('index.js 的两处调用都把响应头传给了 upstreamFailure', as
   assert.equal(calls.length, 2, `expected 2 call sites to pass the header, found ${calls.length}`)
 })
 
+asyncTest('部署文档里的 BASE_URL 与实际拓扑一致（不是 host.docker.internal）', async () => {
+  // 这条为一个真实错误而写：文档曾把 `host.docker.internal` 当成通用做法，
+  // 但它只在「桥与 Hindsight 同一台机器」时有效。本项目的部署目标里两者在不同
+  // 机器上（桥在电脑、Hindsight 在 NAS），照抄会连不上，而且失败方式隐蔽。
+  const setup = await readFile(new URL('./docs/hindsight-setup.md', import.meta.url), 'utf8')
+  const envBlock = setup.match(/### 改之后（零成本）[\s\S]*?```yaml\n([\s\S]*?)```/)
+  assert.ok(envBlock !== null, 'setup doc should have a "改之后" yaml block')
+  const baseUrl = /HINDSIGHT_API_LLM_BASE_URL:\s*(\S+)/.exec(envBlock[1])
+  assert.ok(baseUrl !== null, 'the block must set HINDSIGHT_API_LLM_BASE_URL')
+  assert.ok(
+    !baseUrl[1].includes('host.docker.internal'),
+    `the deploy block must not use host.docker.internal for a cross-host setup, got ${baseUrl[1]}`,
+  )
+  assert.match(baseUrl[1], /^http:\/\/\d+\.\d+\.\d+\.\d+:\d+\/v1$/,
+    `BASE_URL should be a LAN IP + /v1, got ${baseUrl[1]}`)
+})
+
+asyncTest('部署文档明确区分了「同一台机器」与「不同机器」两种拓扑', async () => {
+  const setup = await readFile(new URL('./docs/hindsight-setup.md', import.meta.url), 'utf8')
+  assert.match(setup, /同一台机器/, 'must cover the same-host case')
+  assert.match(setup, /0\.0\.0\.0/, 'must show how to bind for the cross-host case')
+  assert.match(setup, /host\.docker\.internal.*只在/s, 'must warn that host.docker.internal is same-host only')
+})
+
 process.stdout.write('\ndocumented surface matches the implementation\n')
 
 /**

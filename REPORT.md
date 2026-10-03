@@ -359,7 +359,8 @@ node scripts/cost-analysis.mjs                # 从你自己的 Hindsight 账单
 environment:
   # ── 必改：4 个环节统一指向桥 ─────────────────────────────
   HINDSIGHT_API_LLM_PROVIDER: openai
-  HINDSIGHT_API_LLM_BASE_URL: http://host.docker.internal:18999/v1
+  # ⚠️ 填**跑桥那台机器的局域网 IP**（桥与 Hindsight 不同机器时）
+  HINDSIGHT_API_LLM_BASE_URL: http://192.168.31.21:18999/v1
   HINDSIGHT_API_LLM_API_KEY: local
   HINDSIGHT_API_LLM_MODEL: space-bunny-free
 
@@ -382,8 +383,19 @@ environment:
   在整合那种 17–19k token 的调用上会不够。
 - **建议关思考。** 思考 token 与正文抢同一份额度，对「只要结论」的记忆提取纯浪费。
   你原来就用 `HINDSIGHT_API_LLM_EXTRA_BODY` 关掉了，这里保留同样的字段名即可。
-- **容器访问宿主机的桥**：加 `extra_hosts: ["host.docker.internal:host-gateway"]`，
-  这样桥**仍然只绑 127.0.0.1**，不需要把门开到局域网。
+- **⚠️ `BASE_URL` 里的地址取决于桥和 Hindsight 是不是同一台机器。**
+  你的情况是**不同机器**（桥在电脑 `192.168.31.21`，Hindsight 在 NAS `192.168.31.123`），
+  所以桥必须绑 `HOST=0.0.0.0`，`BASE_URL` 填**桥那台机器的局域网 IP**。
+  `host.docker.internal` 在这里**是错的**——它指向 NAS 自己的宿主机。
+
+  实测两种绑定的差别：
+
+  | 桥的绑定 | 从 `192.168.31.21:18999` 访问 |
+  | --- | --- |
+  | 默认 `127.0.0.1` | ❌ 不可达（`netstat` 显示只 LISTEN 在 `127.0.0.1:18999`） |
+  | `HOST=0.0.0.0` | ✅ `HTTP 200`，模型正常返回 `LAN_OK` |
+
+  暴露到局域网后记得开防火墙只放行你的网段，并给桥加鉴权（详见 setup 文档）。
 
 完整的部署步骤、常见问题、各环节单独配模型的写法见
 **`free-llm-bridge/docs/hindsight-setup.md`**。

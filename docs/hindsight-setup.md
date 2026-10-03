@@ -6,29 +6,37 @@
 ## 架构
 
 ```text
-                        ┌──────────────────────────────────────┐
- 飞牛 NAS                │  Hindsight 容器（ghcr.io/vectorize-io│
- ┌──────────┐           │            /hindsight）               │
- │ hindsight│  :8888    │                                      │
- │  容器    │◄──────────┤  retain / reflect / consolidation /   │
- │          │           │  mental-model refresh                │
- └──────────┘           │        ↓ 4 个环节共用同一条 base_url  │
+                         ┌──────────────────────────────────────┐
+  飞牛 NAS  192.168.31.123                                  │
+  ┌──────────┐           │  Hindsight 容器（ghcr.io/vectorize-io│
+  │ hindsight│  :8888    │            /hindsight）               │
+  │  容器    │◄──────────┤  retain / reflect / consolidation /   │
+  └──────────┘           │  mental-model refresh                │
+        ▲                └────────────┬─────────────────────────┘
+        │                             │  OpenAI 兼容 HTTP
+        │                             │  ⚠️ 必须用跑桥那台机器的**局域网 IP**
+        │                             │     不能用 host.docker.internal
+        │                ┌────────────▼─────────────────────────┐
+        │  你的电脑 192.168.31.21                                │
+        └────────────────│  free-llm-bridge（单文件 Node 服务）   │
+          局域网访问 :18999 ◄─────┤  会话亲和 · 指纹门 · 多车道转移  │
                         └────────────┬─────────────────────────┘
-                                     │  OpenAI 兼容 HTTP
-                        ┌────────────▼─────────────────────────┐
- 宿主机                │  free-llm-bridge（单文件 Node 服务）   │
- │ :18999 ◄────────────┤  会话亲和 · 指纹门 · 免费档故障转移  │
- └──────────┘           └────────────┬─────────────────────────┘
                                      │  Authorization: Bearer public
                         ┌────────────▼─────────────────────────┐
                         │  OpenCode Zen 免密车道（零成本）      │
-                        │  86 个模型，其中 13 个 `-free`       │
-                        │  ⚠️ 但实测只有 1 个能第三方直连      │
+                        │  86 个模型，13 个 `-free`             │
+                        │  同一时刻 1 个可直连，其余限流待恢复  │
                         └──────────────────────────────────────┘
 ```
 
-关键点：**桥跑在宿主机上，容器通过 `host.docker.internal` 或局域网 IP 访问它。**
-不要把桥装进 Hindsight 容器里——桥需要能独立于 Hindsight 存活。
+**关键点：桥和 Hindsight 在不同的机器上。** 所以：
+
+1. 桥要绑 `HOST=0.0.0.0`，容器用**跑桥那台机器的局域网 IP**访问它；
+2. 不要把桥装进 Hindsight 容器里——桥需要能独立于 Hindsight 存活；
+3. `host.docker.internal` 在这里**无效**（它指向 NAS 自己，不是你的电脑）。
+
+> 这一步实测过：桥绑回环时 `192.168.31.21:18999` 不可达；改成 `0.0.0.0` 后
+> 同一个地址返回 `HTTP 200` 且模型正常返回 `LAN_OK`。
 
 ## 第一步：把桥跑起来
 
@@ -54,26 +62,71 @@ curl http://127.0.0.1:18999/v1/models | jq -r '.data[].id'
 node scripts/probe-free-models.mjs
 ```
 
-会逐个打一遍 `-free` 模型并给出 verdict。实测结论：13 个 `-free` 里目前只有
-`space-bunny-free` 能第三方直连调用，其余是 429 限流 / 403 opencode-only / 403 地区门 / 500。
+会逐个打一遍 `-free` 模型并给出 verdict。实测结论：13 个 `-free` 里，
+**同一时刻**只有 `space-bunny-free` 能第三方直连调用；其余是
+429 限流（约 90 分钟后恢复）/ 403 opencode-only / 403 地区门 / 500。
 **如果这个探针的输出和你的情况差很多，请以你的实测为准。**
 
 > `api_key` 随便填一个非空字符串。桥不需要真 key——它用的是上游公开车道的
 > `Bearer public`。填 `local` 就行。
 
-### 让 NAS 容器能访问
+### 让 NAS 容器能访问 —— 先看清你的拓扑
 
-默认只绑 `127.0.0.1`，NAS 上的容器够不着。两个办法，**二选一，不要两个都开**：
+**这一步是整套部署里最容易搞错的地方**，因为「桥和 Hindsight 是不是同一台机器」
+决定了该用哪种办法。先回答这个问题：
 
-**办法 A（推荐）：只绑局域网 IP + 防火墙**
+```text
+情况 1：Hindsight 容器与桥在同一台机器
+        → 用 `host.docker.internal`，桥可以继续只绑回环（更安全）
 
-```bash
-HOST=0.0.0.0 node index.js --port 18999
+情况 2：Hindsight 在另一台机器（如 NAS），桥在你的电脑上   ← 大多数人的情况
+        → 必须让桥绑到局域网地址，容器用那台机器的 IP 访问
 ```
 
-然后在飞牛 NAS 的防火墙里只放行 `192.168.31.0/24` 访问 18999。
+⚠️ **`host.docker.internal` 只在「同一台机器」时有效。** 它解析到的是**宿主机**，
+而情况 2 里的宿主机是 NAS 自己，不是你跑桥的电脑。实测：桥绑回环时，
+NAS 容器用 `host.docker.internal` 会连到 NAS 的 18999（没有东西在听），
+而不是你电脑上的桥——**而且它不会报「连不上」，而是连上 NAS 上别的东西或超时**，
+很难查。
 
-**办法 B：桥继续只绑回环，容器用 host 网络**
+#### 情况 2：桥在另一台机器（推荐按这个做）
+
+```bash
+# Windows PowerShell
+$env:HOST = "0.0.0.0"
+node index.js --port 18999
+```
+
+`HOST=0.0.0.0` 表示监听所有网卡。实测这一步之后，从局域网 IP 访问就通了：
+
+```
+192.168.31.21:18999/health -> HTTP 200
+模型 space-bunny-free 返回 LAN_OK
+```
+
+然后 **Hindsight 的 `BASE_URL` 填跑桥那台机器的局域网 IP**：
+
+```yaml
+HINDSIGHT_API_LLM_BASE_URL: http://192.168.31.21:18999/v1
+```
+
+**必须做的两件安全收尾**（暴露到局域网不是小事）：
+
+1. **开防火墙，只放行你的网段**——不要对整个互联网开放：
+
+   ```powershell
+   New-NetFirewallRule -DisplayName "free-llm-bridge" -Direction Inbound `
+     -Protocol TCP -LocalPort 18999 -RemoteAddress 192.168.31.0/24 -Action Allow
+   ```
+
+2. **给桥加一个自己的 key。** 桥默认接受任意非空 `Authorization`（面向本机自用）。
+   暴露到局域网后，同网段任何设备都能花掉你的免费额度。改 `index.js` 里的
+   `authorizeRequest`，或直接套一层 nginx / Caddy 做 basic auth。
+
+> 桥的鉴权是**请求级**的，不是会话级——所以一旦开了局域网，
+> 「本地自用」这个前提就不成立了。
+
+#### 情况 1：同一台机器
 
 在 Hindsight 的 compose 里加：
 
@@ -82,8 +135,8 @@ extra_hosts:
   - "host.docker.internal:host-gateway"
 ```
 
-这样容器内可以用 `http://host.docker.internal:18999/v1`，
-而桥**仍然只监听 127.0.0.1**——不需要把门开到局域网。这个更安全，推荐。
+`BASE_URL` 用 `http://host.docker.internal:18999/v1`，桥**仍然只监听 127.0.0.1**，
+不需要把门开到局域网。这个更安全。
 
 ## 第二步：改 Hindsight 的环境变量
 
@@ -105,8 +158,9 @@ environment:
 ```yaml
 environment:
   # ── 4 个环节统一指向桥 ──────────────────────────────────────
+  # ⚠️ BASE_URL 填**跑桥那台机器的局域网 IP**，不是 host.docker.internal
   HINDSIGHT_API_LLM_PROVIDER: openai
-  HINDSIGHT_API_LLM_BASE_URL: http://host.docker.internal:18999/v1
+  HINDSIGHT_API_LLM_BASE_URL: http://192.168.31.21:18999/v1
   HINDSIGHT_API_LLM_API_KEY: local
   HINDSIGHT_API_LLM_MODEL: space-bunny-free
 
@@ -159,10 +213,11 @@ docker logs -f free-llm-bridge
 出现 `routing` 行说明**故障转移正常工作**：首选被限流，桥自动换了另一个免费档，
 没有停下来，也没有去碰付费模型。
 
-⚠️ 但注意一个现实：目前 13 个 `-free` 里只有 `space-bunny-free` 真能第三方直连，
-所以上面这种 `routing X -> space-bunny-free` 实际上是在收敛到**同一个**模型。
-限流时它不报错，但**没有真正的备份模型**顶上去。如果 `space-bunny-free` 也被打满，
-桥会回 429 带 `retry-after`。这种情况请直接看下面第九节的备用路线。
+⚠️ 但注意一个现实：**同一时刻** 13 个 `-free` 里通常只有 `space-bunny-free` 可直连，
+所以上面这种 `routing X -> space-bunny-free` 往往是在收敛到同一个模型。这仍然满足
+「限流不停下来」，但**没有即时备份**——被限流的那几个要等约 90 分钟才恢复。
+
+想要即时的备份，只能自己加一条独立车道（README 的「多车道」一节）。
 
 ## 各环节可以配不同模型
 
@@ -198,9 +253,18 @@ environment:
 ## 常见问题
 
 **Q: 报 429 `Rate limit exceeded`。**
-免费车道按 session 计额。桥已经做了会话亲和，正常不该频繁触发。真触发时桥会
-自动换模型；日志里的 `routing X -> Y` 就是证据。如果连 `space-bunny-free` 都被限流，
-说明候选池里确实没有第二个可用模型了（见「第三步」的说明），此时请转备用路线。
+上游会带一个 `retry-after`（实测约 5400 秒 / 90 分钟量级，且真实递减）。
+桥会**按这个时长**把该模型记进冷却，而不是每 60 秒重试一次——否则会在一个半小时的
+窗口里反复撞同一面墙。冷却期间请求会自动落到别的可用模型上。
+
+想看当前冷却情况：
+
+```bash
+curl -s http://127.0.0.1:18999/health | jq '{throttled, retryInSec, lanes: [.lanes[].available]}'
+```
+
+若 `lanes` 全部 `false`，说明这一刻确实没有可用目标，此时才会真的回 429。
+此时请转备用路线（README 的「多车道」一节：自己注册一条免费 key 车道）。
 
 **Q: 报 403 `FreeTierError`。**
 两种可能，桥都能自动处理，但值得知道原因：
