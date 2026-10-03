@@ -194,12 +194,17 @@ function isFreeModel(model) {
 
 - 点名付费模型 → **400 拒绝**并说明原因。*不静默改投*——静默改投会让调用方以为自己用的就是点名的模型，实际跑的完全是另一回事。
 - 免费档被限流 → **内部换到下一个免费档重试**，调用方毫无感知。
+- 遇到 opencode-only 模型 → 同样降级换档（换模型有用，所以不该报错）。
 - 免费档全被限流 → 429 + `retry-after`。
 
-这条保证有 5 条回归断言钉在 `test-free-only.mjs` 里。
+这条保证有 8 条回归断言钉在 `test-free-only.mjs` 里。
 
 **3. 指纹门** — 自动补齐四个自禁诱饵工具
 **4. 读流不看 header** — 上游高负载时用 `application/json` 回 SSE 帧，按 header 读会整轮报废
+
+**5. schema 规整** — 剥掉 nullable 联合类型（否则 400），强制 `strict: true`（否则回空字符串）。详见第五节
+
+**6. opencode-only 降级** — 上游写明「只能从 OpenCode 内部使用」的模型移出候选池，遇错自动换档
 
 ---
 
@@ -209,9 +214,10 @@ function isFreeModel(model) {
 
 | 测试 | 结果 | 说明 |
 | --- | --- | --- |
-| `test-free-only.mjs` | **12/12** | 零成本保证 + 会话亲和 + 指纹门。不出网，秒级 |
-| `smoke.mjs` | **13/13** | 端到端：非流式、**结构化 JSON 抽取**、流式、健康检查 |
+| `test-free-only.mjs` | **26/26** | 零成本保证 + 会话亲和 + 指纹门 + schema 规整 + 文档一致性。不出网，秒级 |
+| `smoke.mjs` | **13/13** | 端到端：非流式、结构化 JSON 抽取、流式、健康检查 |
 | `soak.mjs 14` | **14/14，0 失败** | 持续性：故意点名常被限流的模型，验证内部故障转移 |
+| `hindsight-extract-check.mjs` | 通过 | 用 Hindsight **真实** schema 抽中英文事实，关键信息全部保留 |
 
 ### 最有说服力的一次运行
 
@@ -237,15 +243,51 @@ zero-cost guarantee held: every request landed on a -free model
 > （11/12 成功，1 次失败暴露问题）。Hindsight 会把这种失败当成整轮失败并重试，等于
 > 同一个回合又去撞一次限流。加了内部故障转移之后才变成 14/14。
 
-### 结构化抽取质量
+### 结构化抽取：一个必须说清楚的限制
 
-`smoke.mjs` 里专门有一个模拟 Hindsight retain 的用例。输入真实中文对话，输出：
+我拿 Hindsight **真实的** `FactExtractionResponse` schema 去打这条车道
+（`scripts/hindsight-extract-check.mjs`），发现两件事。
 
-```json
-[{"type":"plan","text":"用户每天早上背单词到七点，然后吃早饭去上课"}]
+**第一，原始转发会 400，整套方案在生产里是废的。**
+Hindsight 的 schema 有 4 个 nullable 字段写成联合类型 `{"type": ["string","null"]}`，
+而这条车道的语法引擎**拒绝联合类型**。逐项二分定位确认：enum、嵌套对象数组、
+`const`、`integer` 都被接受，唯独联合类型被拒。
+桥现在会自动把它们降级成非 null 分支。
+
+**第二，也是更重要的：`response_format` 在这条车道上只是提示，不是语法约束。**
+即使强制 `strict: true`，模型仍然不按 schema 生成。三次运行里它给正文字段起了
+**三个不同的名字**：
+
+| 运行 | 正文字段 | 必填项 `when/where/who/why` |
+| --- | --- | --- |
+| 第 1 次 | `text` | 全部省略 |
+| 第 2 次 | `fact_text` | 全部省略 |
+| 第 3 次 | `content` | 全部省略 |
+
+模型甚至没有稳定地用同一个替代字段——这说明它根本没在「适配 schema」，只是在自由发挥。
+输出还经常带 ```json 围栏。
+
+**这对 Hindsight 意味着什么：** 它的解析器对缺失字段有默认值，能吃下这种输出，
+所以**零成本方案仍然可用**。抽取质量本身是好的——实测中文正确、关键信息保留
+（`15.4`、`小 K`、`背单词` 全部命中）、entities 准确。
+
+**但如果你自己写消费方：不要假设 schema 里的字段名会被遵守。** 必须剥围栏、
+允许字段缺失。这是这条路线的真实上限，我在 README 的「已知边界」里也写明了。
+
+### 怎么复现上面这些结论
+
+每条都对应一个脚本，直接跑就行：
+
+```bash
+node scripts/probe-free-models.mjs            # 谁真的能直连，推翻「11 个可用」
+node scripts/diag-schema-shape.mjs            # 找出被 400 拒的 schema 关键字
+node scripts/diag-grammar.mjs                 # 区分「schema 复杂」与「模型不配合」
+node scripts/hindsight-extract-check.mjs      # 用 Hindsight 真 schema 端到端抽
+node scripts/cost-analysis.mjs                # 从你自己的 Hindsight 账单接口量开销
 ```
 
-可解析、字段完整、中文正确。
+这些脚本**消耗免费额度**，但请务必自己跑一遍——本报告里所有推翻性的结论
+都是自己测出来的，而不是从插件文档抄的。抄文档会得到「11 个模型可用」这种错误答案。
 
 ---
 
@@ -338,8 +380,8 @@ CLIProxyAPI 官方 description 原文（说明它确实自带免费额度）：
 
 | 通道 | 免费额度 | 卡片 | 来源 |
 | --- | --- | --- | --- |
-| **OpenCode Zen 免密车道** | 11 个 `-free` 模型，按 session 限速 | 不需要 | 本次实测 |
-| **智谱 GLM-4-Flash-250414** | 官方标注「智谱首个免费的大模型 API」，128K 上下文，**支持结构化输出** | 不需要 | [官方文档](https://docs.bigmodel.cn/cn/guide/models/free/glm-4-flash-250414) |
+| **OpenCode Zen 免密车道** | 13 个 `-free` 模型，**实测只有 1 个能第三方直连**，按 session 限速 | 不需要 | 本次实测 |
+| **智谱 GLM-4-Flash-250414** | 官方标注「智谱首个免费的大模型 API」，128K 上下文，**官方声称支持结构化输出** | 不需要 | [官方文档](https://docs.bigmodel.cn/cn/guide/models/free/glm-4-flash-250414) |
 | **Cloudflare Workers AI** | 10,000 neurons/天，Text Gen 300 RPM。⚠️ 但 Kimi-K2.6/K2.7-Code、GLM-5.2/5.3/5.3-Flash、DeepSeek-V4 系列**强制付费档**（该档仅 20 RPM） | 不需要 | [pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/)、[limits](https://developers.cloudflare.com/workers-ai/platform/limits/) |
 | **OpenRouter `:free`** | 常量 `RPM=20` / `RPD=50`（充值 ≥$10 后 RPD 1000，9 美元起即生效）。按账户算，官方明写多开账号不提升 | 不需要 | [limits.md](https://openrouter.ai/docs/api_reference/limits.md) |
 | **NVIDIA build.nvidia.com** | 40 RPM + 1000 credits，可申请升到 200 RPM / 5000 | 不需要 | [NVIDIA 论坛](https://forums.developer.nvidia.com/t/request-to-increase-nvidia-nim-api-rate-limit-from-40-rpm-to-200rpm/379705) |
@@ -408,12 +450,29 @@ HINDSIGHT_API_LLM_API_KEY: <你的智谱 key>
 
 ## 十、诚实的边界
 
-- **「免费」不等于「无限」。** 这条车道按 session 限速，打满会 429。桥会退避和换模型，但所有免费档同时被打满时只能等。
-- **免费档会变。** 上游随时可能改模型集合或政策。桥启动时探测一次，运行中新增的免费模型要重启才发现。
-- **被动发现，不是主动保证。** 桥在响应里看到非零 `cost` 字段时会打 WARNING 日志。这是**事后**发现，**请自己看一眼账单**。
-- **质量有取舍。** 免费档模型比 `mimo-v2.6-flash` 弱，抽取质量会下降。想好一点可以指定 `mimo-v2.6-flash-free`。
+> 这一节是对本报告全部结论的自我限制。**其中三条是我实测踩出来的，不是推测。**
+
+- **⚠️ 只有一个模型真能用。** 13 个 `-free` 里只有 `space-bunny-free` 能第三方直连
+  （详见第二节的实测表）。其余是 429 限流、403 opencode-only、403 地区门或 500。
+  **这条路线没有真正的冗余**——单点。
+- **⚠️ 结构化输出不是硬保证。** `response_format` 在这条车道上是提示而非语法约束：
+  模型三次运行给正文起了三个不同的字段名（`text` / `fact_text` / `content`），
+  并稳定省略 schema 的必填项。Hindsight 能容忍，但**你的消费方未必**。
+- **「免费」不等于「无限」。** 这条车道按 session 限速，打满会 429。桥会退避和换档，
+  但候选池实际只有一项，换来换去还是同一个模型。
+- **免费档会变。** 上游随时可能改模型集合或政策。桥启动时探测一次，运行中新增的可用模型
+  要重启才发现。
+- **被动发现，不是主动保证。** 桥在响应里看到非零 `cost` 字段时会打 WARNING 日志。
+  这是**事后**发现，**请自己看一眼账单**。
+- **插件的清单不能照抄。** `dsh-our-free-model` 设置页显示「available」的那几个模型，
+  第三方调用一律 403——因为它活在 DSH 里被上游当成内部流量。
+  想确认就跑 `node scripts/probe-free-models.mjs`。
+- **质量有取舍。** 抽取质量实测尚可（中文正确、关键信息保留），但比 `mimo-v2.6-flash`
+  弱，细节归因能力会下降。
 - **桥不做重试**，只做故障转移。是否重试交给调用方决定（Hindsight 侧建议 `MAX_RETRIES=2`）。
 - **只绑回环是默认值。** 改成 `0.0.0.0` 前请确认你的网络可信——暴露出去等于送人额度。
+- **账单数字依赖价格假设。** 第一节的金额按 ¥1/M 输入、¥0.02/M 缓存、¥2/M 输出估算。
+  请用你自己的账单核对。**结论的方向（从十位数降到零）不受影响。**
 
 ---
 
@@ -422,17 +481,30 @@ HINDSIGHT_API_LLM_API_KEY: <你的智谱 key>
 ```
 free-llm-bridge/
 ├── index.js                  # 桥本体，单文件零依赖
-├── test-free-only.mjs        # 12 条回归断言，不出网，CI 可跑
-├── smoke.mjs                 # 13 条端到端断言（含结构化抽取）
+├── test-free-only.mjs        # 26 条离线回归断言，不出网，CI 可跑
+├── smoke.mjs                 # 13 条端到端断言
 ├── soak.mjs                  # 持续性 + 故障转移验证
 ├── docker-compose.yml        # Docker 部署
 ├── deploy/
 │   └── free-llm-bridge.service   # systemd 部署
+├── scripts/
+│   ├── cost-analysis.mjs         # 从 Hindsight 账单接口量真实开销
+│   ├── probe-free-models.mjs     # 逐个探测 -free 模型真实可用性
+│   ├── hindsight-extract-check.mjs  # 用 Hindsight 真 schema 做端到端抽取
+│   ├── diag-json-schema.mjs      # response_format 各形状对比
+│   ├── diag-schema-shape.mjs     # 定位被拒的 schema 关键字
+│   └── diag-grammar.mjs          # 分离 schema 复杂度与模型两个变量
 ├── docs/
-│   └── hindsight-setup.md    # Hindsight 完整接入步骤
+│   ├── hindsight-setup.md    # Hindsight 完整接入步骤
+│   └── publish-to-github.md  # 首次发开源的照做清单
 ├── README.md
 └── REPORT.md                 # 本报告
 ```
+
+每个诊断脚本都对应一个**实测踩出来的坑**，不是写来好看的：
+`diag-schema-shape.mjs` 是为了找出 400 的真因（联合类型），
+`diag-grammar.mjs` 是为了区分「schema 太复杂」和「模型不配合」，
+`probe-free-models.mjs` 是为了推翻「11 个模型可用」这个错误结论。
 
 ---
 

@@ -31,7 +31,16 @@ node index.js
 
 ## 它在做什么
 
-上游是一个公开的免密车道（OpenCode Zen 网关），11 个模型的 id 以 `-free` 结尾。
+上游是一个公开的免密车道（OpenCode Zen 网关），13 个模型的 id 以 `-free` 结尾。
+
+> ⚠️ **但 `-free` 不等于「第三方能直接用」。** 逐个实测（`node scripts/probe-free-models.mjs`）
+> 后发现，13 个里**只有 `space-bunny-free` 能直连调用**。另外 4 个
+> （`fledge-alpha-free`、`nemotron-3-*`、`longcat-2.5-preview-free`）返回
+> `403 FreeTierError: OpenCode's free tier can only be used from within OpenCode`
+> —— 上游按**调用来源**做了硬限制，不是请求头问题（对照实验：`space-bunny-free`
+> 不带任何指纹头也能成功）。其余几个是限流或地区受限。
+>
+> 所以「11 个模型随便挑」是不成立的，请读 [下面的已知边界](#已知边界)。
 桥把那条车道封装成一个标准的 OpenAI 兼容服务，并解决四个让它能真正**持续**使用的问题。
 
 ### 1. 会话亲和 —— 最关键的一步
@@ -175,12 +184,33 @@ environment:
 
 ## 已知边界
 
-- **「免费」不等于「无限」。** 这条车道按 session 限速，短时间打满会回 429。桥会退避
-  并换模型，但所有免费档同时被打满时只能等。
-- **地区门。** 部分模型对某些地区的出口直接 403（实测 CN 出口下 `muse-spark-1.3-contributor-free`
+> 这一节请认真读。这个项目最容易被误解的地方全在这里，而且**大部分结论都是我实测出来的，
+> 不是从上游文档或插件 README 抄的**——两者在关键一点上不一致（见下）。
+
+- **⚠️ 只有一个模型真能直连用。** 13 个 `-free` 里，`space-bunny-free` 可用；
+  `fledge-alpha-free`、`nemotron-3-ultra-free`、`nemotron-3.5-lightning-free`、
+  `longcat-2.5-preview-free` 一律 403 `OpenCode's free tier can only be used from
+  within OpenCode`——上游按**调用来源**限制，不按请求头（`space-bunny-free` 不带任何
+  指纹头也能成功）。桥会把这 4 个移出候选池，并在遇到它们时自动换档。
+  **代价是：故障转移的候选池实际上只有一项**，限流时没有第二个真正可用的模型可换。
+  这是这条路线的真实上限，不是可以靠配置绕过的。
+- **插件的探测结果会骗人。** `dsh-our-free-model` 的设置页显示那些模型「available」，
+  但那是它在 DSH 进程里探测的——上游把它当成 OpenCode 内部流量。**第三方工具照抄这个
+  清单会踩空。** 想确认就自己跑 `node scripts/probe-free-models.mjs`。
+- **`/v1/models` 列的是「免费且未被实测排除」的模型**，不等于「此刻一定能用」。
+  限流与地区门是运行时的，探测不出来。
+- **「免费」不等于「无限」。** 这条车道按 session 限速，短时间打满会回 429。
+- **地区门。** 部分模型对某些地区的出口直接 403（实测 CN 出口下 `muse-spark-1.3/1.2-contributor-free`
   被挡）。桥把这些模型排除在候选池外。
+- **结构化输出需要桥做规整。** 免费车道的语法引擎拒绝 nullable 联合类型
+  （`{"type": ["string", "null"]}`），而 Hindsight 的 `FactExtractionResponse` 有 4 个这样的字段。
+  桥会自动降级成非 null 分支并强制 `strict: true`。**你自己写 schema 时也要注意：
+  用 `anyOf` 或可空分支代替联合类型可以避开这个问题。**
+- **语法强制不是 100% 可靠。** 实测同一个模型 + 同一个 schema，输出时而干净、时而带
+  ```json 围栏。所以**调用方仍应容错**：剥围栏再 `JSON.parse`。Hindsight 自己的解析器
+  会做这件事，但你的代码未必。
 - **免费档会变。** 模型集合与额度政策由上游决定，随时可能调整。桥在启动时探测一次，
-  但运行中新增的免费模型要重启才被发现。
+  但运行中新增的可用模型要重启才被发现。
 - **上游哪天改成计费怎么办？** 桥在响应里看到非零 `cost` 字段时会打 WARNING 日志。
   这是被动发现，不是主动保证——**请自己看一眼账单**。
 - **桥不做重试。** 它把故障转移交给调用方决定（因为只有调用方知道该不该重试）。

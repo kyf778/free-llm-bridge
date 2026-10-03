@@ -1,0 +1,30 @@
+记录一个必须说清楚的限制：结构化输出不是硬保证
+
+用 Hindsight 真实的 FactExtractionResponse schema 端到端实测（三次运行）发现：
+即使桥强制了 strict:true，这条车道的语法引擎也没有真正按 schema 生成。
+
+同一份 schema，模型三次给正文字段起了三个不同的名字：
+
+  第 1 次   text
+  第 2 次   fact_text
+  第 3 次   content
+
+并且稳定省略 when/where/who/why 这些 schema 必填项，输出还经常带 ```json 围栏。
+
+模型连一个稳定的替代字段都没用，说明它不是在「适配 schema」，只是在自由发挥。
+response_format 在这条车道上是提示，不是语法约束。
+
+对 Hindsight 的影响：它的解析器对缺失字段有默认值，能吃下这种输出，所以零成本
+方案仍然可用。实测抽取质量本身是好的——中英文都正确、关键信息全部保留
+（15.4、小 K、背单词）、entities 准确。
+
+但 README 的「已知边界」里新增了这条提醒：自己的消费方必须剥围栏、允许字段缺失。
+
+hindsight-extract-check.mjs 的退出码也调整了：已知的 schema 字段偏差不再让脚本
+失败退出（否则每次都红就没人再跑），真正该失败的——请求被拒、JSON 解析不了、
+抽不出事实、关键信息丢失——仍然会 exit 1。
+
+顺带把报告与 README 里所有「11 个 -free 可用」的旧说法换成实测结论，
+并修掉 hindsight-setup.md 里推荐 fledge-alpha / nemotron 的旧配置。
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>

@@ -22,7 +22,8 @@
                                      │  Authorization: Bearer public
                         ┌────────────▼─────────────────────────┐
                         │  OpenCode Zen 免密车道（零成本）      │
-                        │  86 个模型，其中 11 个 `-free`       │
+                        │  86 个模型，其中 13 个 `-free`       │
+                        │  ⚠️ 但实测只有 1 个能第三方直连      │
                         └──────────────────────────────────────┘
 ```
 
@@ -44,8 +45,18 @@ curl http://127.0.0.1:18999/health
 # {"ok":true,"service":"free-llm-bridge","upstream":"https://opencode.ai","models":86,...}
 
 curl http://127.0.0.1:18999/v1/models | jq -r '.data[].id'
-# 只列出 11 个 -free 模型；付费档不会出现
+# 付费档不会出现；实测不可用的 opencode-only 模型也已排除
 ```
+
+**上机之前先跑一次真实可用性探测**，别只看清单：
+
+```bash
+node scripts/probe-free-models.mjs
+```
+
+会逐个打一遍 `-free` 模型并给出 verdict。实测结论：13 个 `-free` 里目前只有
+`space-bunny-free` 能第三方直连调用，其余是 429 限流 / 403 opencode-only / 403 地区门 / 500。
+**如果这个探针的输出和你的情况差很多，请以你的实测为准。**
 
 > `api_key` 随便填一个非空字符串。桥不需要真 key——它用的是上游公开车道的
 > `Bearer public`。填 `local` 就行。
@@ -142,38 +153,73 @@ docker logs -f free-llm-bridge
 在 Hindsight 里跑一次 retain，然后看桥的 stderr：
 
 ```text
-[free-llm-bridge] routing space-bunny-free -> fledge-alpha-free (requested is throttled)
+[free-llm-bridge] routing mimo-v2.6-flash-free -> space-bunny-free (requested is throttled)
 ```
 
 出现 `routing` 行说明**故障转移正常工作**：首选被限流，桥自动换了另一个免费档，
 没有停下来，也没有去碰付费模型。
 
+⚠️ 但注意一个现实：目前 13 个 `-free` 里只有 `space-bunny-free` 真能第三方直连，
+所以上面这种 `routing X -> space-bunny-free` 实际上是在收敛到**同一个**模型。
+限流时它不报错，但**没有真正的备份模型**顶上去。如果 `space-bunny-free` 也被打满，
+桥会回 429 带 `retry-after`。这种情况请直接看下面第九节的备用路线。
+
 ## 各环节可以配不同模型
 
-Hindsight 支持按环节分别配置。如果你想让成本敏感的环节走更稳的模型：
+Hindsight 支持按环节分别配置。**但在本方案下意义有限**——可直连的免费模型只有一个，
+分环节配也换不出花来。写在这里是为了将来上游放开更多模型时你不用再查文档：
 
 ```yaml
 environment:
-  # retain 是 85% 的开销所在，用结构化输出最稳的免费档
+  # 三个都省略时全部回落到全局 HINDSIGHT_API_LLM_MODEL，行为与不配一致
   HINDSIGHT_API_RETAIN_LLM_MODEL: space-bunny-free
-  # reflect 交互性强，用更快的
-  HINDSIGHT_API_REFLECT_LLM_MODEL: fledge-alpha-free
-  # 后台整合可以更宽松
-  HINDSIGHT_API_CONSOLIDATION_LLM_MODEL: nemotron-3.5-lightning-free
+  HINDSIGHT_API_REFLECT_LLM_MODEL: space-bunny-free
+  HINDSIGHT_API_CONSOLIDATION_LLM_MODEL: space-bunny-free
 ```
 
-三个都省略时全部回落到全局 `HINDSIGHT_API_LLM_MODEL`，行为与不配一致。
+> ⚠️ 别照抄旧版本文档里 `fledge-alpha-free` / `nemotron-3.5-lightning-free` 这类写法——
+> 实测它们对第三方调用一律 403 `OpenCode's free tier can only be used from within OpenCode`。
+
+## 排错要点
+
+各环节的开销占比差异很大。实测最近 200 次调用：
+
+| operation | 次数 | 平均 token/次 | 占比 |
+| --- | ---: | ---: | ---: |
+| consolidation | 103 | 20,419 | 52% |
+| retain | 63 | 5,686 | 32% |
+| refresh_mental_model | 31 | 16,760 | 16% |
+
+**consolidation 是大头**，比 retain 还贵 3.6 倍。如果将来免费额度不够用，
+优先看 consolidation 跑了多频繁，而不是先去压 retain。
+
+用 `node scripts/cost-analysis.mjs` 量你自己的真实账单。
 
 ## 常见问题
 
 **Q: 报 429 `Rate limit exceeded`。**
 免费车道按 session 计额。桥已经做了会话亲和，正常不该频繁触发。真触发时桥会
-自动换模型；日志里的 `routing X -> Y` 就是证据。连续出现说明这批免费模型都被打满了，
-见 README 的「备用路线」。
+自动换模型；日志里的 `routing X -> Y` 就是证据。如果连 `space-bunny-free` 都被限流，
+说明候选池里确实没有第二个可用模型了（见「第三步」的说明），此时请转备用路线。
 
 **Q: 报 403 `FreeTierError`。**
-上游要求请求里声明 `bash/glob/grep/read` 四个工具名。桥会自动补齐诱饵工具，
-所以这条不该出现——出现了说明桥的版本不对，确认用的是本仓库的 `index.js`。
+两种可能，桥都能自动处理，但值得知道原因：
+
+1. `OpenCode's free tier can only be used from within OpenCode` —— 你点了名一个上游
+   限制为「仅 OpenCode 内部可用」的模型（`fledge-alpha-free`、`nemotron-3-*`、
+   `longcat-2.5-preview-free`）。桥会自动换到 `space-bunny-free`。
+2. 缺少 `bash/glob/grep/read` 工具声明 —— 桥会自动补齐诱饵工具，所以不该出现。
+   真出现了说明桥的版本不对，确认用的是本仓库的 `index.js`。
+
+**Q: 报 400 `invalid_request_error`。**
+多半是 `response_format` 里用了 nullable 联合类型 `{"type": ["string", "null"]}`——
+免费车道的语法引擎拒绝它。桥会自动降级，但如果是你自己的 schema 直接打到上游，
+请改成 `anyOf` 或去掉可空分支。
+
+**Q: retain 抽出零条事实，但请求显示 200 成功。**
+这是 `json_schema` 不带 `strict` 时车道的静默失败（回空字符串）。桥已强制
+`strict: true`。另外实测语法强制不是 100% 可靠，输出可能带 ```json 围栏——
+解析前先剥围栏。
 
 **Q: 记忆提取出来的东西质量下降。**
 这是预期内的取舍：免费档模型比 `mimo-v2.6-flash` 弱。换 `mimo-v2.6-flash-free`
