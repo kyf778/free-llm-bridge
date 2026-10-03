@@ -1,0 +1,11 @@
+# 仓库文本统一用 LF。Windows 上编辑器可能把工作区写成 CRLF 而 git status 不报错，
+# 这会让 diff 出现整文件变更，也会让按字节计算的校验出问题。
+* text=auto eol=lf
+
+*.js   text eol=lf
+*.mjs  text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+*.service text eol=lf
+LICENSE text eol=lf
+.gitignore text eol=lf
