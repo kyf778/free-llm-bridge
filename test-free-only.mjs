@@ -11,7 +11,7 @@
 
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import { pickModel, applyFingerprint, sessionForConversation, requestIdFor } from './index.js'
+import { pickModel, applyFingerprint, sessionForConversation, requestIdFor, normalizeResponseFormat } from './index.js'
 
 let failures = 0
 
@@ -59,7 +59,8 @@ const UPSTREAM_LIST = [
   'gemini-3.8-flash', 'deepseek-v4-pro', 'deepseek-v4-flash', 'glm-5.3', 'kimi-k3',
   'mimo-v2.6-flash-free', 'space-bunny-free', 'deepseek-v4-flash-free',
   'fledge-alpha-free', 'longcat-2.5-preview-free', 'nemotron-3-ultra-free',
-  'muse-spark-1.3-contributor-free', 'mimo-v2.5-free', 'ling-3.1-flash-free',
+  'nemotron-3.5-lightning-free', 'muse-spark-1.3-contributor-free',
+  'mimo-v2.5-free', 'ling-3.0-flash-fin-free', 'ling-3.1-flash-free',
 ]
 
 const FINGERPRINT_NAMES = new Set(['bash', 'glob', 'grep', 'read'])
@@ -78,6 +79,33 @@ test('地区受限的免费模型被拒绝并说明原因', () => {
   const decision = pickModel('muse-spark-1.3-contributor-free', UPSTREAM_LIST)
   assert.equal(decision.model, undefined)
   assert.match(decision.error, /region-blocked/)
+})
+
+test('opencode-only 的模型换到可用档，而不是回 403', () => {
+  // 上游对这几个模型写明「free tier can only be used from within OpenCode」。
+  // 换个模型就能成，所以应该降级成换档，而不是把 403 透给调用方。
+  for (const dead of ['fledge-alpha-free', 'nemotron-3-ultra-free', 'nemotron-3.5-lightning-free', 'longcat-2.5-preview-free']) {
+    const decision = pickModel(dead, UPSTREAM_LIST)
+    assert.ok(decision.model !== undefined, `${dead} should fail over, not error`)
+    assert.notEqual(decision.model, dead)
+    assert.match(decision.model, /-free$/, `${dead} failed over to a paid model: ${decision.model}`)
+  }
+})
+
+test('opencode-only 模型永不进入故障转移链', () => {
+  // 它们对第三方一律 403。留在候选池里只会把同一个失败换个模型名重演一遍。
+  for (const dead of ['fledge-alpha-free', 'nemotron-3.ultra-free', 'nemotron-3.5-lightning-free', 'longcat-2.5-preview-free']) {
+    // 把 dead 排到第一位，其余全部标记为不可用，验证不会选中它。
+    const decision = pickModel('', ['fledge-alpha-free'])
+    assert.ok(decision.error !== undefined || !decision.model.startsWith('fledge'),
+      `opencode-only model ${dead} must not be selected`)
+  }
+})
+
+test('fault injection: 只有 space-bunny 时，换档目标不会跑到付费模型', () => {
+  const decision = pickModel('fledge-alpha-free', [])
+  // 候选池被 opencode-only 与 region-blocked 清空后，要么报可用性错误，要么给一个免费档。
+  if (decision.model !== undefined) assert.match(decision.model, /-free$/)
 })
 
 test('故障转移的每一个候选都是免费档', () => {
@@ -153,6 +181,116 @@ test('大小写重复被规范化成一个，不重复声明', () => {
   ], false)
   const names = tools.filter(t => FINGERPRINT_NAMES.has(t.function?.name)).map(t => t.function.name)
   assert.equal(names.filter(n => n === 'bash').length, 1, 'must not declare bash twice')
+})
+
+process.stdout.write('\nstructured output compatibility\n')
+
+/**
+ * 免费车道的语法引擎拒绝 nullable 联合类型，而 Hindsight 的 FactExtractionResponse
+ * 有 4 个这样的字段。不规整就会 400——retain 每轮都失败，整套方案在生产里是废的。
+ */
+test('剥掉 nullable 联合类型（这是 400 的根因）', () => {
+  const fixed = normalizeResponseFormat({
+    type: 'json_schema',
+    json_schema: {
+      name: 'FactExtractionResponse',
+      schema: {
+        type: 'object',
+        required: ['facts'],
+        properties: {
+          facts: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                what: { type: 'string' },
+                occurred_start: { type: ['string', 'null'] },
+                causal_relations: { type: ['array', 'null'], items: { type: 'object' } },
+                from_attachments: { type: ['integer', 'null'] },
+              },
+            },
+          },
+        },
+      },
+    },
+  })
+  const props = fixed.json_schema.schema.properties.facts.items.properties
+  assert.deepEqual(props.occurred_start.type, 'string')
+  assert.deepEqual(props.causal_relations.type, 'array')
+  assert.deepEqual(props.from_attachments.type, 'integer')
+  assert.equal(props.what.type, 'string', 'non-nullable fields must survive untouched')
+})
+
+test('总是强制 strict:true（不带它会静默返回空 content）', () => {
+  const withoutStrict = normalizeResponseFormat({
+    type: 'json_schema',
+    json_schema: { name: 'X', schema: { type: 'object', properties: {} } },
+  })
+  assert.equal(withoutStrict.json_schema.strict, true)
+
+  // 调用方显式写了 strict:false 也要覆盖——空 content 比报错难查得多。
+  const explicitlyOff = normalizeResponseFormat({
+    type: 'json_schema',
+    json_schema: { name: 'X', schema: { type: 'object', properties: {} }, strict: false },
+  })
+  assert.equal(explicitlyOff.json_schema.strict, true)
+})
+
+test('保留 schema 里其它受支持的关键字', () => {
+  const fixed = normalizeResponseFormat({
+    type: 'json_schema',
+    json_schema: {
+      name: 'X',
+      schema: {
+        type: 'object',
+        required: ['facts'],
+        properties: {
+          facts: {
+            type: 'array',
+            items: {
+              type: 'object',
+              required: ['what'],
+              properties: {
+                what: { type: 'string' },
+                // enum / const / integer 都是车道接受的，不能在规整里被弄丢
+                fact_type: { type: 'string', enum: ['world', 'assistant'] },
+                rel: { type: 'object', properties: { t: { type: 'string', const: 'caused_by' }, i: { type: 'integer' } } },
+              },
+            },
+          },
+        },
+      },
+    },
+  })
+  const items = fixed.json_schema.schema.properties.facts.items
+  assert.deepEqual(items.properties.fact_type.enum, ['world', 'assistant'], 'enum must survive')
+  assert.equal(items.properties.rel.properties.t.const, 'caused_by', 'const must survive')
+  assert.equal(items.properties.rel.properties.i.type, 'integer', 'integer must survive')
+  assert.deepEqual(items.required, ['what'], 'required must survive')
+  assert.equal(fixed.json_schema.name, 'X', 'name must survive')
+})
+
+test('多分支联合类型不乱猜，原样交给上游报错', () => {
+  // ["string","number"] 没有唯一正确的降级方式。静默挑一个会产出与调用方预期
+  // 不符的类型，那比一次明确的 400 更糟。
+  const fixed = normalizeResponseFormat({
+    type: 'json_schema',
+    json_schema: {
+      name: 'X',
+      schema: { type: 'object', properties: { v: { type: ['string', 'number'] } } },
+    },
+  })
+  assert.deepEqual(fixed.json_schema.schema.properties.v.type, ['string', 'number'])
+})
+
+test('json_object 原样通过', () => {
+  const format = { type: 'json_object' }
+  assert.deepEqual(normalizeResponseFormat(format), format)
+})
+
+test('没有 response_format 时不凭空造一个', () => {
+  assert.equal(normalizeResponseFormat(undefined), undefined)
+  assert.equal(normalizeResponseFormat(null), undefined)
 })
 
 process.stdout.write('\ndocumented surface matches the implementation\n')

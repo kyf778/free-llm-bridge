@@ -111,17 +111,45 @@ x-opencode-project: global
 部分模型对某些出口 IP 直接拒绝。实测你的 CN 出口（`59.175.124.94`）下
 `muse-spark-1.3-contributor-free` 和 `1.2` 被挡。
 
-### 实测清单
+### 实测清单 —— 重要更正
 
-`GET https://opencode.ai/zen/v1/models` 返回 **86 个模型**，其中 **11 个** id 以 `-free` 结尾：
+`GET https://opencode.ai/zen/v1/models` 返回 **86 个模型**，其中 **13 个** id 以 `-free` 结尾。
+但**「以 `-free` 结尾」不等于「第三方能直接用」**。
 
-```
-jev-1.13-free, deepseek-v4-flash-free, mimo-v2.6-flash-free, space-bunny-free,
-longcat-2.5-preview-free, mimo-v2.5-free, ling-3.0-flash-fin-free,
-nemotron-3-ultra-free, nemotron-3.5-lightning-free, fledge-alpha-free, ling-3.1-flash-free
-```
+我最初（和插件的探测结果）都以为这 13 个都能直连。**逐个实测之后发现不是。**
+用 `node scripts/probe-free-models.mjs` 复现：
 
-⚠️ **另外 75 个是按量计费的付费档**（`gpt-5`、`claude-opus-5`、`mimo-v2.6-flash` 非 free 档…）。这一点极其关键，下面第四节专门讲。
+| 模型 | 直连结果 |
+| --- | --- |
+| **space-bunny-free** | ✅ **可用** |
+| mimo-v2.6-flash-free / mimo-v2.5-free / deepseek-v4-flash-free / ling-3.0-flash-fin-free / ling-3.1-flash-free | ⚠️ 429 限流（模型本身能用，只是这一刻被打满） |
+| longcat-2.5-preview-free / nemotron-3-ultra-free / nemotron-3.5-lightning-free / fledge-alpha-free | ❌ **403 `FreeTierError: OpenCode's free tier can only be used from within OpenCode`** |
+| muse-spark-1.3 / 1.2-contributor-free | ❌ 403 地区受限（CN 出口） |
+| jev-1.13-free | ❌ 500 |
+
+**关键结论：13 个 `-free` 里，只有 1 个（`space-bunny-free`）能被第三方工具直接调用。**
+
+那 4 个 `opencode-only` 的模型不是「我的请求头不对」——对照实验证明 `space-bunny-free`
+**不带任何 `x-opencode-*` 指纹头也能成功**，所以不是头部问题，是上游对那几个模型
+**按来源做了硬限制**：只有从 OpenCode 自己的基础设施发起的请求才放行。
+
+这也解释了插件的探测为什么和我的结果不同：插件活在 DSH 里，其身份/链路可能让上游
+把它判定为「来自 OpenCode 内部」，于是那些模型在插件里看起来可用。
+
+> ⚠️ **这一条推翻了本报告初版的一个核心结论。** 初版说「11 个免费档，故障转移有 11 个候选」，
+> 那是从插件的可用性清单抄来的，不是自己测的。自己测只有一个能用。
+> 下面的实测数据与「故障转移」一节都据此修正。
+
+### ⚠️ 故障转移的承诺需要下调
+
+因为可直连的候选基本只有一个，`soak.mjs` 里看到的 `[failover from mimo-v2.6-flash-free]`
+并不是「换到了另一个可用模型」，而是 `mimo-v2.6-flash-free` 429 之后换到了
+`space-bunny-free`——**两次都是同一个模型**。这仍然满足了「限流不停下来」，
+但**不满足「换到另一个不同的模型」**。
+
+所以故障转移代码本身是对的（遇到 429 会换），但**可用候选池实际上只有一项**。
+真要靠故障转移顶住限流，得先把候选池扩到 2 个以上——而这需要上游放开那些
+`opencode-only` 的模型，或者换一条完全不同的免费车道（见第九节）。
 
 ---
 

@@ -56,13 +56,29 @@ const PORT = Number(process.env.PORT || args.port || 18999)
 /** 上游车道。默认是 OpenCode Zen —— Our Free Model 插件逆向出来的唯一来源。 */
 const UPSTREAM_BASE = (process.env.UPSTREAM_BASE || 'https://opencode.ai').replace(/\/+$/, '')
 
-/** 兜底模型顺序：首选被限流时沿这条线往下找。 */
+/**
+ * 兜底模型顺序：首选被限流时沿这条线往下找。
+ *
+ * 顺序按 2026-10-05 逐个直连实测排定，见 scripts/probe-free-models.mjs：
+ *
+ *   space-bunny-free            ✅ 可用，且不带任何指纹头也能用
+ *   mimo-v2.6-flash-free        ⚠️ 429 限流——模型本身能用，只是被打满
+ *   deepseek-v4-flash-free      ⚠️ 同上
+ *   ling-3.0-flash-fin-free     ⚠️ 同上
+ *   ling-3.1-flash-free         ⚠️ 同上
+ *   mimo-v2.5-free              ⚠️ 同上
+ *   jev-1.13-free               ❌ 500
+ *
+ * 这几个被**排除**在顺序之外，因为它们对第三方调用一律 403
+ * `FreeTierError: OpenCode's free tier can only be used from within OpenCode`——
+ * 换过去只是把同一个失败换个模型名重演一遍，白等一个 RTT：
+ *   longcat-2.5-preview-free, nemotron-3-ultra-free,
+ *   nemotron-3.5-lightning-free, fledge-alpha-free
+ * 对照实验：space-bunny-free 不带 x-opencode-* 也能成功，所以这不是请求头问题，
+ * 是上游对那几个模型按来源做了硬限制。
+ */
 const FALLBACK_ORDER = [
   'space-bunny-free',
-  'fledge-alpha-free',
-  'nemotron-3.5-lightning-free',
-  'longcat-2.5-preview-free',
-  'nemotron-3-ultra-free',
   'mimo-v2.6-flash-free',
   'deepseek-v4-flash-free',
   'ling-3.0-flash-fin-free',
@@ -74,6 +90,21 @@ const FALLBACK_ORDER = [
 const KNOWN_REGION_BLOCKED = new Set([
   'muse-spark-1.3-contributor-free',
   'muse-spark-1.2-contributor-free',
+])
+
+/**
+ * 已实测对第三方调用一律 403 的模型——上游写明「free tier can only be used from
+ * within OpenCode」。把它们从候选池里彻底去掉：留着只会让故障转移把同一个失败
+ * 换个模型名再演一遍，每换一次白等一个 RTT。
+ *
+ * 与 `KNOWN_REGION_BLOCKED` 分开记，因为成因不同（地区 vs 调用来源），
+ * 万一上游放开限制，只需要动这一个集合。
+ */
+const KNOWN_OPENCODE_ONLY = new Set([
+  'longcat-2.5-preview-free',
+  'nemotron-3-ultra-free',
+  'nemotron-3.5-lightning-free',
+  'fledge-alpha-free',
 ])
 
 /**
@@ -300,10 +331,10 @@ function cooldownRemainingSec(model) {
  * @returns {{model: string}|{error: string}} 要用的模型，或一条如实说明为什么不能用
  */
 export function pickModel(requested, available) {
-  // 候选池先按「免费」过滤，再去掉地区受限的。这是防止把账单接回去的最后一道闸：
-  // 任何非 `-free` 的模型都不得进入候选，哪怕它此刻可用。
+  // 候选池先按「免费」过滤，再去掉地区受限与 opencode-only 的。这是防止把账单
+  // 接回去的最后一道闸：任何非 `-free` 的模型都不得进入候选，哪怕它此刻可用。
   const pool = (available.length > 0 ? available : FALLBACK_ORDER)
-    .filter(model => isFreeModel(model) && !KNOWN_REGION_BLOCKED.has(model))
+    .filter(model => isFreeModel(model) && !KNOWN_REGION_BLOCKED.has(model) && !KNOWN_OPENCODE_ONLY.has(model))
 
   // 下游点名了付费模型：如实拒绝，并说明只有免费档可用。静默改投别的模型会让调用方
   // 以为自己用的就是它点名的那个模型，而实际跑的完全是另一回事。
@@ -312,6 +343,15 @@ export function pickModel(requested, available) {
   }
   if (requested !== '' && KNOWN_REGION_BLOCKED.has(requested)) {
     return { error: `model "${requested}" is region-blocked from this network egress` }
+  }
+  if (requested !== '' && KNOWN_OPENCODE_ONLY.has(requested)) {
+    // 这几个模型上游只放行来自 OpenCode 自身的请求，换档有用，所以降级成换模型而不是报错。
+    const alternative = pickModel('', pool)
+    if (alternative.model !== undefined) {
+      log(`routing ${requested} -> ${alternative.model} (upstream restricts ${requested} to OpenCode-internal calls)`)
+      return alternative
+    }
+    return { error: `model "${requested}" is restricted to OpenCode-internal calls, and no alternative free model is available` }
   }
   if (requested !== '' && pool.includes(requested) && !inCooldown(requested)) {
     return { model: requested }
@@ -340,7 +380,13 @@ export function upstreamFailure(status, detail, model) {
     markThrottled(model, retryAfterOf(text))
     return { ok: false, status: 429, type: 'rate_limit_error', message: `upstream rate limit on ${model}` }
   }
+  // 「只能从 OpenCode 内部使用」：换模型有用，所以和 429 一样在桥内部换档。
+  if (status === 403 && /only be used from within OpenCode/i.test(text)) {
+    KNOWN_OPENCODE_ONLY.add(model)
+    return { ok: false, status: 403, type: 'invalid_request_error', message: `model ${model} is restricted to OpenCode-internal calls` }
+  }
   if (status === 403 && /region/i.test(text)) {
+    KNOWN_REGION_BLOCKED.add(model)
     return { ok: false, status: 403, type: 'invalid_request_error', message: `model ${model} is not available in this region` }
   }
   if (status === 404 || /Model is unavailable/i.test(text)) {
@@ -362,6 +408,79 @@ async function safeErrorBody(response) {
 // ---------------------------------------------------------------------------
 
 /**
+ * 把下游的 `response_format` 规整成免费车道能接受的形状。
+ *
+ * ## 为什么需要这一步
+ *
+ * Hindsight 的 retain 靠 `response_format` 拿结构化 JSON，它的
+ * `FactExtractionResponse` schema 里有 4 个 nullable 字段（`occurred_start`、
+ * `occurred_end`、`causal_relations`、`from_attachments`），写法是 JSON Schema 的
+ * 联合类型 `{"type": ["string", "null"]}`。
+ *
+ * 实测（2026-10-05，逐项二分定位）：免费车道的语法引擎**拒绝联合类型**，
+ * 原样转发会拿到 400 `invalid_request_error`——也就是 retain 每轮都失败。
+ * 同一套 schema 里 enum、嵌套对象数组、`const` 都被接受，唯独联合类型不行。
+ *
+ * 另有一个更隐蔽的坑：**`json_schema` 不带 `strict` 时，车道回 200 但 content 是
+ * 空字符串**。这不是报错，是静默失败——retain 会「成功」地抽取出零条事实。
+ * 所以这里总是把 `strict` 打开，让语法引擎接管生成。
+ *
+ * ## 怎么改
+ *
+ * 联合类型降级成不带 null 的那个非 null 类型。字段在 Hindsight 里本来就有对应的
+ * 缺省语义（`occurred_*` 不给就是「无日期」，`causal_relations` 不给就是「无因果」），
+ * 少一个键与给一个 null 键在这套 schema 里是等价的。
+ *
+ * @param {object|undefined} format 下游发来的 response_format
+ * @returns {object|undefined} 规整后的 response_format；无可用字段时返回 undefined
+ */
+export function normalizeResponseFormat(format) {
+  if (format === undefined || format === null) return undefined
+  if (format.type === 'json_object') return format
+  if (format.type !== 'json_schema' || format.json_schema?.schema === undefined) {
+    return format
+  }
+  return {
+    type: 'json_schema',
+    json_schema: {
+      ...format.json_schema,
+      schema: stripNullableUnions(format.json_schema.schema),
+      // 总是强制 strict：不带它时车道会回空 content，那比 400 更难查。
+      strict: true,
+    },
+  }
+}
+
+/**
+ * 递归剥掉 schema 里的 nullable 联合类型。
+ *
+ * 只处理「联合里恰好有一个 null」这一种——那是可空字段的惯用写法。
+ * 出现多个非 null 分支（`["string","number"]`）时不做处理，交给上游自己报错：
+ * 在那里静默挑一个分支会产出与调用方预期不符的类型，比一次明确的 400 更糟。
+ *
+ * @param {*} node schema 的任意节点
+ * @returns {*} 处理后的节点；不可处理时原样返回
+ */
+function stripNullableUnions(node) {
+  if (Array.isArray(node)) return node.map(stripNullableUnions)
+  if (node === null || typeof node !== 'object') return node
+
+  const out = {}
+  for (const [key, value] of Object.entries(node)) {
+    if (key === 'type' && Array.isArray(value)) {
+      const nonNull = value.filter(entry => entry !== 'null')
+      if (nonNull.length === 1 && nonNull.length !== value.length) {
+        out.type = nonNull[0]
+        continue
+      }
+    }
+    out[key] = stripNullableUnions(value)
+  }
+  // 空 object 节点（如 `properties: {}`）保持原样即可。
+  return out
+}
+
+/**
  * 跑完一整轮补全。
  *
  * 首选模型被限流时在这里**内部**换到下一个免费档重试，而不是把 429 透给调用方。
@@ -377,7 +496,10 @@ async function safeErrorBody(response) {
  */
 async function complete(model, body, ids) {
   const flat = isResponsesModel(model)
+  const responseFormat = normalizeResponseFormat(body.response_format)
   const payload = { ...body, model, tools: applyFingerprint(body.tools, flat) }
+  if (responseFormat !== undefined) payload.response_format = responseFormat
+  else delete payload.response_format
 
   if (body.stream === true) {
     const response = await fetchUpstream(model, payload, ids, true)
@@ -406,13 +528,15 @@ async function complete(model, body, ids) {
   }
 
   const failure = upstreamFailure(response.status, await safeErrorBody(response), model)
-  // 只有限流值得在桥内部换模型重试一次：地区门与「模型没被路由」换模型也解决不了，
-  // 重试只是把同一个错误再问一遍。
-  if (failure.status !== 429) return failure
+  // 限流与 opencode-only 都值得在桥内部换模型重试一次：这两个是「换个模型就能成」，
+  // 而地区门与「模型没被路由」换模型也解决不了，重试只是把同一个错误再问一遍。
+  const worthFailover = failure.status === 429 ||
+    (failure.status === 403 && KNOWN_OPENCODE_ONLY.has(model))
+  if (!worthFailover) return failure
 
   const next = pickModel('', availableModels).model
   if (next === undefined || next === model) return failure
-  log(`${model} is rate limited; retrying on ${next}`)
+  log(`${model} unusable (${failure.status}); retrying on ${next}`)
   return complete(next, body, ids)
 }
 
