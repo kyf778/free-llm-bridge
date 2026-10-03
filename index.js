@@ -450,9 +450,30 @@ export function inCooldown(lane, model) {
   return until !== undefined && until > Date.now()
 }
 
+/**
+ * 把冷却时长夹到 [下限, 上限]。
+ *
+ * 上游说「等 90 分钟」是可信的，但一个写错的 `retry-after: 999999` 不该让这个模型
+ * 永远消失。封顶 6 小时：足够覆盖任何合理的限流窗口，又保证它一定会回到候选池。
+ *
+ * @param {number|undefined} seconds 上游给的秒数
+ * @returns {number} 实际采用的秒数
+ */
+function clampThrottle(seconds) {
+  const requested = Number.isFinite(seconds) && seconds > 0 ? seconds : DEFAULT_THROTTLE_SEC
+  return Math.min(requested, MAX_THROTTLE_SEC)
+}
+
+const MAX_THROTTLE_SEC = Number(process.env.MAX_THROTTLE_SEC || 21600)
+
 function markThrottled(lane, model, retryAfterSec) {
-  const backoff = Number.isFinite(retryAfterSec) && retryAfterSec > 0 ? retryAfterSec : 60
-  COOLDOWN_UNTIL.set(cooldownKey(lane, model), Date.now() + backoff * 1000)
+  const requested = Number.isFinite(retryAfterSec) && retryAfterSec > 0 ? retryAfterSec : DEFAULT_THROTTLE_SEC
+  const capped = clampThrottle(retryAfterSec)
+  if (capped !== requested) {
+    log(`clamping throttle for ${lane.name}/${model}: upstream asked ${requested}s, using ${capped}s`)
+  }
+  COOLDOWN_UNTIL.set(cooldownKey(lane, model), Date.now() + capped * 1000)
+  return capped
 }
 
 function cooldownRemainingSec(lane, model) {
@@ -602,17 +623,54 @@ export function cooldownSummary() {
   return { targets: waits.length, soonestSec: waits.length > 0 ? Math.min(...waits) : 0 }
 }
 
-function retryAfterOf(text) {
-  const match = /"retry[-_]?after"\s*:\s*"?(\d+)/i.exec(String(text ?? ''))
+/**
+ * 从 429 里取出上游给的等待时长。
+ *
+ * 实测（2026-10-05）：免密车道把 `retry-after` 放在**响应头**里，不在 body 里。
+ * body 只有 `{"type":"error","error":{"type":"FreeUsageLimitError",
+ * "message":"Rate limit exceeded. Please try again later."},"metadata":{}}`——
+ * 没有任何数字。所以只解析 body 会永远拿不到值，然后退回 60 秒默认值。
+ *
+ * 而实测这个值是 5400+ 秒（90 分钟量级）且**真实递减**（连打三次：5425 → 5416 → 5405）。
+ * 也就是说：这些模型是**速率限制**，约 90 分钟后自动恢复。退避 60 秒会让桥在
+ * 接下来一个半小时里反复撞同一面墙——每次都白等一个 RTT。
+ *
+ * 所以优先级是：响应头 > body > 保守默认值。
+ *
+ * @param {string|number|null|undefined} headerValue 响应头的 retry-after
+ * @param {string} bodyText 响应体
+ * @returns {number|undefined} 秒
+ */
+function retryAfterOf(headerValue, bodyText) {
+  const headerSeconds = Number(headerValue)
+  if (Number.isFinite(headerSeconds) && headerSeconds > 0) return headerSeconds
+
+  const match = /"retry[-_]?after"\s*:\s*"?(\d+)/i.exec(String(bodyText ?? ''))
   return match === null ? undefined : Number(match[1])
 }
 
+/**
+ * 没有上游线索时用多久。
+ *
+ * 90 分钟量级不是随手取的：实测这批免费模型的限流窗口就在这个尺度。给得太短会反复撞墙，
+ * 给得太长会让恢复后仍然闲置。
+ */
+const DEFAULT_THROTTLE_SEC = Number(process.env.DEFAULT_THROTTLE_SEC || 5400)
+
 /** 把上游的一次失败翻译成下游能理解的形状，同时更新限流状态。 */
-export function upstreamFailure(status, detail, lane, model) {
+export function upstreamFailure(status, detail, lane, model, retryAfterHeader) {
   const text = String(detail ?? '')
   if (status === 429 || /FreeUsageLimitError/.test(text)) {
-    markThrottled(lane, model, retryAfterOf(text))
-    return { ok: false, status: 429, type: 'rate_limit_error', message: `upstream rate limit on ${lane.name}/${model}` }
+    // 用**夹顶后**的时长回报给调用方，而不是上游原话。否则一个写错的
+    // retry-after: 999999 会让 Hindsight 以为自己要等 11 天。
+    const wait = markThrottled(lane, model, retryAfterOf(retryAfterHeader, text))
+    return {
+      ok: false,
+      status: 429,
+      type: 'rate_limit_error',
+      message: `upstream rate limit on ${lane.name}/${model}; retry in ~${Math.round(wait / 60)}min`,
+      throttleSec: wait,
+    }
   }
   // 「只能从 OpenCode 内部使用」：换模型有用，所以和 429 一样在桥内部换档。
   if (status === 403 && /only be used from within OpenCode/i.test(text)) {
@@ -776,7 +834,7 @@ async function complete(lane, model, body, ids) {
       return failover(lane, model, body, ids, transport)
     }
     if (!response.ok) {
-      const failure = upstreamFailure(response.status, await safeErrorBody(response), lane, model)
+      const failure = upstreamFailure(response.status, await safeErrorBody(response), lane, model, response.headers.get('retry-after'))
       return worthFailoverTo(failure, model, ids) ? failover(lane, model, body, ids, failure) : failure
     }
     // 上游在高负载下会用 application/json 的 content-type 回一整套 SSE 帧。
@@ -825,7 +883,7 @@ async function complete(lane, model, body, ids) {
     return { ok: true, payload: parsed, lane: lane.name, model }
   }
 
-  const failure = upstreamFailure(response.status, await safeErrorBody(response), lane, model)
+  const failure = upstreamFailure(response.status, await safeErrorBody(response), lane, model, response.headers.get('retry-after'))
   return worthFailoverTo(failure, model, ids) ? failover(lane, model, body, ids, failure) : failure
 }
 

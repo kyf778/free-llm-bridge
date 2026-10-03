@@ -242,6 +242,9 @@ environment:
 | `PORT` | `18999` | 监听端口，也可用 `--port` |
 | `UPSTREAM_BASE` | `https://opencode.ai` | 上游车道 |
 | `UPSTREAM_TIMEOUT_MS` | `600000` | 单次上游请求的上限。免费车道思考期可能静默很久 |
+| `MAX_FAILOVER_HOPS` | `16` | 一次请求最多换几次目标。防打转的第二道保险 |
+| `DEFAULT_THROTTLE_SEC` | `5400` | 上游没给 `retry-after` 时的保守退避（实测这批免费模型的限流窗口就在 90 分钟量级） |
+| `MAX_THROTTLE_SEC` | `21600` | 退避上限。一个写错的 `retry-after: 999999` 不该让模型永远消失 |
 
 ---
 
@@ -250,12 +253,15 @@ environment:
 > 这一节请认真读。这个项目最容易被误解的地方全在这里，而且**大部分结论都是我实测出来的，
 > 不是从上游文档或插件 README 抄的**——两者在关键一点上不一致（见下）。
 
-- **⚠️ 开箱即用是单点，而且市场上只有这一条免密车道。** 13 个 `-free` 里只有
-  `space-bunny-free` 能第三方直连；`fledge-alpha-free`、`nemotron-3-ultra-free`、
-  `nemotron-3.5-lightning-free`、`longcat-2.5-preview-free` 一律 403
-  `OpenCode's free tier can only be used from within OpenCode`——上游按**调用来源**限制，
-  不按请求头（`space-bunny-free` 不带任何指纹头也能成功）。桥会把这 4 个移出候选池，
-  并在遇到它们时自动换档。
+- **⚠️ 同一时刻只有 1 个模型可直连。** 13 个 `-free` 里只有 `space-bunny-free` 此刻可用；
+  `fledge-alpha-free`、`nemotron-3-ultra-free`、`nemotron-3.5-lightning-free`、
+  `longcat-2.5-preview-free` **永久** 403 `OpenCode's free tier can only be used from
+  within OpenCode`——上游按**调用来源**限制，不按请求头（`space-bunny-free` 不带任何
+  指纹头也能成功）。桥会把这 4 个移出候选池并在遇到它们时自动换档。
+- **⚠️ 但那 5 个 429 不是永久失效。** 它们带 `retry-after: ~5400s`（90 分钟量级），
+  实测真实递减（`5425 → 5416 → 5405`），即**速率限制、到点自动恢复**。
+  桥尊重上游给的时长而不是一律 60 秒——否则会在一个半小时的窗口里反复撞同一面墙。
+  复现：`node scripts/probe-throttled-depth.mjs`、`node scripts/probe-retry-after.mjs`。
 - **⚠️ 别再找别的免密白嫖了，真没有了。** 实测 11 家（`node scripts/probe-keyless.mjs`）：
   只有 OpenCode 这一家不带 key 也能调；智谱、OpenRouter、SiliconFlow、Kimi、Cerebras、
   Groq、NVIDIA、Cloudflare **全部要 key**。顺带确认 `/zen/go/v1` 这条路径也回

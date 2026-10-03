@@ -122,12 +122,10 @@ x-opencode-project: global
 | 模型 | 直连结果 |
 | --- | --- |
 | **space-bunny-free** | ✅ **可用** |
-| mimo-v2.6-flash-free / mimo-v2.5-free / deepseek-v4-flash-free / ling-3.0-flash-fin-free / ling-3.1-flash-free | ⚠️ 429 限流（模型本身能用，只是这一刻被打满） |
+| mimo-v2.6-flash-free / mimo-v2.5-free / deepseek-v4-flash-free / ling-3.0-flash-fin-free / ling-3.1-flash-free | ⚠️ 429，但**带 `retry-after: ~5400s` 且真实递减** |
 | longcat-2.5-preview-free / nemotron-3-ultra-free / nemotron-3.5-lightning-free / fledge-alpha-free | ❌ **403 `FreeTierError: OpenCode's free tier can only be used from within OpenCode`** |
 | muse-spark-1.3 / 1.2-contributor-free | ❌ 403 地区受限（CN 出口） |
 | jev-1.13-free | ❌ 500 |
-
-**关键结论：13 个 `-free` 里，只有 1 个（`space-bunny-free`）能被第三方工具直接调用。**
 
 那 4 个 `opencode-only` 的模型不是「我的请求头不对」——对照实验证明 `space-bunny-free`
 **不带任何 `x-opencode-*` 指纹头也能成功**，所以不是头部问题，是上游对那几个模型
@@ -136,9 +134,31 @@ x-opencode-project: global
 这也解释了插件的探测为什么和我的结果不同：插件活在 DSH 里，其身份/链路可能让上游
 把它判定为「来自 OpenCode 内部」，于是那些模型在插件里看起来可用。
 
-> ⚠️ **这一条推翻了本报告初版的一个核心结论。** 初版说「11 个免费档，故障转移有 11 个候选」，
-> 那是从插件的可用性清单抄来的，不是自己测的。自己测只有一个能用。
-> 下面的实测数据与「故障转移」一节都据此修正。
+### ⚠️ 第二轮更正：那 5 个 429 是「速率限制」，不是永久关闭
+
+> 这条推翻了本报告前一版的一句话。我当时写「13 个里只有 1 个可用」，
+> 那是**在限流窗口内测的**，把「此刻打满」误当成「不可用」。
+
+实测（`scripts/probe-throttled-depth.mjs` + `scripts/probe-retry-after.mjs`）：
+
+- 5 个模型全部返回 `429` **并在响应头带 `retry-after`**，值在 **5400+ 秒（90 分钟量级）**
+- 换**不同 session** 重试仍 429 → 限流维度不是 session，是别的配额池
+- 间隔 20 秒连打三次，`retry-after` 真实递减：`5425 → 5416 → 5405`
+
+**所以它们是速率限制，约 90 分钟后自动恢复**，构成故障转移链里真实的第二梯队。
+
+**这一条顺带暴露了桥自己的一个 bug**：原先只从**响应体**里解析 `retry-after`，
+而这条车道的数字只在**响应头**里（body 只有一句「Rate limit exceeded」）。
+于是永远拿不到值、退回 60 秒默认值——意味着在长达一个半小时的限流窗口里，
+桥会反复去撞同一面墙，每次白等一个 RTT。现已改为响应头优先，并加了两条断言钉住。
+
+### 关于「故障转移的承诺」
+
+可直连的候选**当前只有 1 个**（`space-bunny-free`）。但这不等于「只有 1 个能用」——
+其余 5 个在各自的限流窗口过去后会恢复，成为真实的第二梯队。桥会把它们记进冷却，
+并**按上游给的真实时长等待**，而不是每 60 秒重试一次。
+
+真正不可用的是那 4 个 `opencode-only`（403，与时间无关）和 2 个地区受限的。
 
 ### ⚠️ 故障转移的承诺需要下调
 

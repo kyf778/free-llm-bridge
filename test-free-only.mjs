@@ -11,7 +11,7 @@
 
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import { pickModel, applyFingerprint, sessionForConversation, requestIdFor, normalizeResponseFormat } from './index.js'
+import { pickModel, applyFingerprint, sessionForConversation, requestIdFor, normalizeResponseFormat, upstreamFailure } from './index.js'
 
 let failures = 0
 
@@ -372,6 +372,43 @@ test('response_format 只发给声明支持的车道', async () => {
   // 官方文档写「支持结构化输出」不等于 OpenAI 兼容层接受 json_schema。
   const source = await readFile(new URL('./index.js', import.meta.url), 'utf8')
   assert.match(source, /else\s*delete payload\.response_format/, 'must delete response_format for lanes that cannot use it')
+})
+
+process.stdout.write('\nthrottle window (respecting the upstream)\n')
+
+/**
+ * 实测：这条车道的 `retry-after` 在**响应头**里，且是 5400+ 秒（90 分钟量级）、
+ * 真实递减。之前只解析 body，body 里根本没有数字，于是永远退回 60 秒默认值——
+ * 意味着限流窗口内桥会反复撞同一面墙。
+ */
+test('尊重上游给的 retry-after（响应头），而不是一律 60 秒', () => {
+  const lane = { name: 'zen', baseUrl: 'http://x.invalid', model: 'space-bunny-free' }
+  const body = JSON.stringify({ type: 'error', error: { type: 'FreeUsageLimitError', message: 'Rate limit exceeded. Please try again later.' }, metadata: {} })
+  // 模拟真实上游：数字只出现在响应头。
+  const fromHeader = upstreamFailure(429, body, lane, 'mimo-v2.6-flash-free', '5416')
+  assert.equal(fromHeader.status, 429)
+  assert.equal(fromHeader.throttleSec, 5416, 'must read retry-after from the header')
+  assert.match(fromHeader.message, /90min/, fromHeader.message)
+
+  // 响应头没有时退回保守默认，而不是 60 秒。
+  const noHeader = upstreamFailure(429, body, lane, 'space-bunny-free', null)
+  assert.equal(noHeader.throttleSec, 5400, 'default must be ~90min, not 60s')
+
+  // body 里有数字时也要认（有些上游放在 body）。
+  const fromBody = upstreamFailure(429, '{"retry_after":120}', lane, 'space-bunny-free', null)
+  assert.equal(fromBody.throttleSec, 120)
+})
+
+test('冷却时长被封顶，一个写错的 retry-after 不会让模型永远消失', () => {
+  const lane = { name: 'zen', baseUrl: 'http://x.invalid', model: 'space-bunny-free' }
+  const absurd = upstreamFailure(429, '', lane, 'weird-model-free', '999999')
+  assert.ok(absurd.throttleSec <= 21600, `capped at 6h, got ${absurd.throttleSec}`)
+})
+
+asyncTest('index.js 的两处调用都把响应头传给了 upstreamFailure', async () => {
+  const source = await readFile(new URL('./index.js', import.meta.url), 'utf8')
+  const calls = [...source.matchAll(/upstreamFailure\(response\.status, await safeErrorBody\(response\), lane, model, response\.headers\.get\('retry-after'\)\)/g)]
+  assert.equal(calls.length, 2, `expected 2 call sites to pass the header, found ${calls.length}`)
 })
 
 process.stdout.write('\ndocumented surface matches the implementation\n')
