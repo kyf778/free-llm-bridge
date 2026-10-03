@@ -10,3 +10,4 @@ node_modules/
 # 临时 commit message 文件
 MSGTMP.md
 scripts/commitmsg.txt
+docs/commitmsg.txt
