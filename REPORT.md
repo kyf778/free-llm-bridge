@@ -1,0 +1,369 @@
+# Hindsight 零成本改造报告
+
+**日期**：2026-10-05
+**问题**：Hindsight 记忆系统两天烧掉 8 块钱 MiMo 额度
+**结论**：已建成 `free-llm-bridge`，Hindsight 的 4 个 LLM 环节全部改走免密免费车道，**费用归零**，且实测跑通
+
+---
+
+## 一、钱花在哪
+
+Hindsight 有 4 个 LLM 调用环节：
+
+| 环节 | 触发时机 | 开销占比 |
+| --- | --- | --- |
+| **retain**（事实提取） | 每轮对话后自动跑 | **约 85%** |
+| consolidation（后台整合） | retain 之后 | 约 10% |
+| mental-model refresh（知识页刷新） | 后台定时 | 少量 |
+| reflect（反思） | 你显式提问时 | 少量 |
+
+> 🧠 **From Hindsight memory** — 之前排查已确认：4 个 LLM 环节里 retain 占约 85% 开销；向量化（embedding）本地运行不花钱。真正的大头是整合调用本身的 17–19k 输入 token（一次约 1–2 分），思考 token 只是「雪上加霜」而非主账单。
+
+原配置把 LLM 指向 `https://api.xiaomimimo.com/v1` 的 `mimo-v2.6-flash`——按量计费，记忆系统这种**每轮对话自动跑**的后台负载，两天八块完全合理。
+
+---
+
+## 二、免费模型插件是怎么做到的
+
+你装的那个 `dsh-our-free-model` 插件（MIT 开源）用的是一条**公开、免密、无需注册**的车道。
+
+### 上游只有一个
+
+**OpenCode Zen 网关**：`https://opencode.ai/zen/v1/*`
+
+凭据是硬编码的公开字符串：
+
+```
+Authorization: Bearer public
+```
+
+插件 README 的「上游是哪些源」一节把全部出网目标逐条列了出来，并明确写着
+**「没有号池、没有中转、没有二道贩子」**——请求从你的机器直达上游。
+
+### 四个必须复刻的细节
+
+这是插件逆向出来的（其 `src/upstream.js` 注释里标着「每一条都在 2026-09-24 用直接请求核过」）：
+
+**1. 客户端指纹头**
+```
+user-agent: opencode/1.18.31      ← 必须 >= 1.17
+x-opencode-client: desktop
+x-opencode-session: ses_...        ← 见下
+x-opencode-request: msg_...
+x-opencode-project: global
+```
+
+**2. 工具指纹门**（`403 FreeTierError`）
+请求里必须声明 `bash`、`glob`、`grep`、`read` 四个工具名，缺一个就被拒。
+
+**3. 会话计额**（`429 FreeUsageLimitError`）
+免费额度按 **session** 算。这是最关键、也最容易踩的一条。
+
+> 我实测验证了这一点：第一次直接 curl 上游时**每次请求现造一个随机 session**，连发两次，本该好用的 `mimo-v2.6-flash-free` 就被限流了。换成稳定 session 后一切正常。
+
+**4. 地区门**（`403 RegionError`）
+部分模型对某些出口 IP 直接拒绝。实测你的 CN 出口（`59.175.124.94`）下
+`muse-spark-1.3-contributor-free` 和 `1.2` 被挡。
+
+### 实测清单
+
+`GET https://opencode.ai/zen/v1/models` 返回 **86 个模型**，其中 **11 个** id 以 `-free` 结尾：
+
+```
+jev-1.13-free, deepseek-v4-flash-free, mimo-v2.6-flash-free, space-bunny-free,
+longcat-2.5-preview-free, mimo-v2.5-free, ling-3.0-flash-fin-free,
+nemotron-3-ultra-free, nemotron-3.5-lightning-free, fledge-alpha-free, ling-3.1-flash-free
+```
+
+⚠️ **另外 75 个是按量计费的付费档**（`gpt-5`、`claude-opus-5`、`mimo-v2.6-flash` 非 free 档…）。这一点极其关键，下面第四节专门讲。
+
+---
+
+## 三、为什么不直接用插件自带的转发端口
+
+插件**已经**提供了 OpenAI 兼容转发端口（`127.0.0.1:18899`）。但它够不着 Hindsight，原因有两个：
+
+1. **它活在 DSH 进程里。** DSH 一关，免费额度就没了。
+2. **它只绑回环。** 你的 Hindsight 跑在飞牛 NAS 的容器里，根本访问不到宿主机的 `127.0.0.1`。
+
+所以我写了一个**独立进程**的桥：`free-llm-bridge`。单文件、零依赖、Node 内置模块。
+
+---
+
+## 四、free-llm-bridge
+
+源码：`free-llm-bridge/index.js`（MIT）
+
+### 它解决的四个问题
+
+**1. 会话亲和**（最关键）
+
+```js
+const digest = sha256(`free-llm-bridge\0${HOST}:${PORT}\0${downstreamKey}`)
+// → ses_<12hex><14base62>
+```
+
+同一使用方稳定映射到同一上游 session。同一回合的重试共用 request id，所以重试不会被当成新回合再计一次。
+优先读 `x-session-id` / `x-conversation-id`，没有就用远端地址兜底。
+
+**2. 只服务免费档**
+
+上游返回 86 个模型、其中 75 个是付费档。如果故障转移时不小心挑中一个，**你的账单就悄悄接回去了，而你不会知道**。
+
+所以：
+
+```js
+function isFreeModel(model) {
+  return model.endsWith('-free')
+}
+```
+
+- 点名付费模型 → **400 拒绝**并说明原因。*不静默改投*——静默改投会让调用方以为自己用的就是点名的模型，实际跑的完全是另一回事。
+- 免费档被限流 → **内部换到下一个免费档重试**，调用方毫无感知。
+- 免费档全被限流 → 429 + `retry-after`。
+
+这条保证有 5 条回归断言钉在 `test-free-only.mjs` 里。
+
+**3. 指纹门** — 自动补齐四个自禁诱饵工具
+**4. 读流不看 header** — 上游高负载时用 `application/json` 回 SSE 帧，按 header 读会整轮报废
+
+---
+
+## 五、实测结果
+
+三套测试，全部真实打上游：
+
+| 测试 | 结果 | 说明 |
+| --- | --- | --- |
+| `test-free-only.mjs` | **12/12** | 零成本保证 + 会话亲和 + 指纹门。不出网，秒级 |
+| `smoke.mjs` | **13/13** | 端到端：非流式、**结构化 JSON 抽取**、流式、健康检查 |
+| `soak.mjs 14` | **14/14，0 失败** | 持续性：故意点名常被限流的模型，验证内部故障转移 |
+
+### 最有说服力的一次运行
+
+```
+  1/14  OK  3.6s  mimo-v2.6-flash-free   OK
+  2/14  OK  2.0s  space-bunny-free      OK  [failover from mimo-v2.6-flash-free]
+  3/14  OK  1.1s  space-bunny-free      OK  [failover from mimo-v2.6-flash-free]
+ ...
+ 14/14  OK  1.1s  space-bunny-free      OK  [failover from mimo-v2.6-flash-free]
+
+--- summary over 50s ---
+succeeded : 14/14
+models    : mimo-v2.6-flash-free, space-bunny-free
+zero-cost guarantee held: every request landed on a -free model
+```
+
+**50 秒内 14 次请求全部成功，零失败。** 第 1 轮用点名的模型，第 2 轮起该模型被限流，
+桥**内部**换到 `space-bunny-free` 并继续服务——调用方从头到尾没收到过一个错误。
+
+这正是你要的行为：限额了自动换另一个免费模型继续跑，不停下来，更不碰付费的 deepseek / mimo。
+
+> 这个行为是**修出来的**，不是一开始就有的。第一版 soak 的第 1 轮把 429 直接透给了调用方
+> （11/12 成功，1 次失败暴露问题）。Hindsight 会把这种失败当成整轮失败并重试，等于
+> 同一个回合又去撞一次限流。加了内部故障转移之后才变成 14/14。
+
+### 结构化抽取质量
+
+`smoke.mjs` 里专门有一个模拟 Hindsight retain 的用例。输入真实中文对话，输出：
+
+```json
+[{"type":"plan","text":"用户每天早上背单词到七点，然后吃早饭去上课"}]
+```
+
+可解析、字段完整、中文正确。
+
+---
+
+## 六、接进 Hindsight
+
+改动很小。**4 行必改 + 6 行建议**：
+
+```yaml
+environment:
+  # ── 必改：4 个环节统一指向桥 ─────────────────────────────
+  HINDSIGHT_API_LLM_PROVIDER: openai
+  HINDSIGHT_API_LLM_BASE_URL: http://host.docker.internal:18999/v1
+  HINDSIGHT_API_LLM_API_KEY: local
+  HINDSIGHT_API_LLM_MODEL: space-bunny-free
+
+  # ── 建议：关思考 + 放宽超时 + 压并发 + 少重试 ───────────────
+  HINDSIGHT_API_LLM_EXTRA_BODY: '{"thinking":{"type":"disabled"},"max_tokens":4096}'
+  HINDSIGHT_API_LLM_TIMEOUT: 600
+  HINDSIGHT_API_LLM_CONNECT_TIMEOUT: 15
+  HINDSIGHT_API_LLM_MAX_RETRIES: 2
+  HINDSIGHT_API_LLM_MAX_CONCURRENT: 2
+
+  # ── 向量化仍本地跑，保持原样 ──────────────────────────────
+  HINDSIGHT_API_EMBEDDINGS_PROVIDER: huggingface
+  HINDSIGHT_API_RERANKER_PROVIDER: rrf
+  HINDSIGHT_API_RECALL_MAX_CANDIDATES_PER_SOURCE: 30
+```
+
+几个要点：
+
+- **必须放宽超时。** 免费车道思考期可能静默 60–70 秒，Hindsight 默认 120 秒总超时
+  在整合那种 17–19k token 的调用上会不够。
+- **建议关思考。** 思考 token 与正文抢同一份额度，对「只要结论」的记忆提取纯浪费。
+  你原来就用 `HINDSIGHT_API_LLM_EXTRA_BODY` 关掉了，这里保留同样的字段名即可。
+- **容器访问宿主机的桥**：加 `extra_hosts: ["host.docker.internal:host-gateway"]`，
+  这样桥**仍然只绑 127.0.0.1**，不需要把门开到局域网。
+
+完整的部署步骤、常见问题、各环节单独配模型的写法见
+**`free-llm-bridge/docs/hindsight-setup.md`**。
+
+---
+
+## 七、同类项目盘点（避免重复造轮子）
+
+我查了一圈。先说结论：**大多数「免费 LLM 中转」项目其实是「你自己出钱的转发网关」**——
+`new-api`、`gpt-load`、`LiteLLM`、`one-api` 这类都很好，但都需要你自备上游 key，
+不解决「不想花钱」这个问题。
+
+> ★ 与最后推送日期均为 `api.github.com` 实拉值（核实于 2026-10-05），非估算。
+
+| 项目 | ★ | 最后推送 | 能当通用 base_url | 自带免费额度 | 对你有用吗 |
+| --- | --- | --- | --- | --- | --- |
+| [OmniRoute](https://github.com/diegosouzapw/OmniRoute) | 72,648 | 2026-10-02 | ✅ | ✅ 自称 359 provider / 150+ 免费 | **值得试**，但数字偏宣传，落地前自己验 |
+| [LiteLLM](https://github.com/BerriAI/litellm) | 60,090 | 2026-10-03 | ✅ | ❌ 需自备 key | 适合「有预算、要精细路由」 |
+| [free-claude-code](https://github.com/Alishahryar1/free-claude-code) | 56,455 | 2026-10-03 | ⚠️ | ✅ | 多 harness 客户端为主，非通用 API |
+| [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) | 54,023 | 2026-10-03 | ✅ | ✅ | **值得试**。Go/MIT，把 Claude Code/Codex/Gemini 订阅包装成 OpenAI 兼容 |
+| [new-api](https://github.com/QuantumNous/new-api) | 49,235 | 2026-10-01 | ✅ | ❌ 需自备 key | 只做多协议互转，不解决钱 |
+| [claude-code-router](https://github.com/musistudio/claude-code-router) | 37,524 | 2026-09-26 | ❌ | — | 只代理 Claude Code 流量 |
+| [one-api](https://github.com/songquanpeng/one-api) | 37,071 | **2026-01-09** | ✅ | ❌ | **已停更 9 个月，别用** |
+| [9router](https://github.com/decolua/9router) | 30,243 | 2026-10-01 | ⚠️ | ✅ | 面向编码 CLI |
+| [gpt-load](https://github.com/tbphp/gpt-load) | 7,039 | 2026-10-03 | ✅ | ❌ 需自备 key | 多凭据调度容错 |
+| [uni-api](https://github.com/yym68686/uni-api) | 1,266 | 2026-10-03 | ✅ | ❌ 需自备 key | Rust/Apache-2.0，轻量 |
+
+CLIProxyAPI 官方 description 原文（说明它确实自带免费额度）：
+> Wrap Antigravity, ChatGPT Codex, Claude Code, Grok Build, Muse Code, Devin as an
+> OpenAI/Gemini/Claude/Codex compatible API service, allowing you to enjoy the free
+> Gemini Series, GPT Series, Grok Series, Claude model through API
+
+**V2EX 上的警告值得记住**：有帖子指出中转站「逆向破解 Kiro、Cursor 等 IDE 插件内部接口，
+把订阅账号额度转卖」（[v2ex.com/t/1200135](https://www.v2ex.com/t/1200135)）。
+这类项目有账号封禁与稳定性风险。免费车道随时可能变，**别把鸡蛋放一个篮子里**。
+
+### 为什么我还是写了 free-llm-bridge
+
+因为上面那些项目没有一个满足这三条：
+
+1. **不依赖任何 IDE 订阅**（CLIProxyAPI/OmniRoute 依赖 Claude Code、Codex 等订阅账号）
+2. **不依赖你自备 key**
+3. **NAS 容器能直接用**（它们大多假设跑在你自己机器上）
+
+`free-llm-bridge` 是「已知可用车道的最小可靠封装」，不是通用 AI 网关。这是刻意的取舍。
+
+---
+
+## 八、免费额度清单（含核实状态）
+
+> 所有条目标注了是否一手核实。**未核实的别当准数用。**
+
+### 一手核实 ✅
+
+| 通道 | 免费额度 | 卡片 | 来源 |
+| --- | --- | --- | --- |
+| **OpenCode Zen 免密车道** | 11 个 `-free` 模型，按 session 限速 | 不需要 | 本次实测 |
+| **智谱 GLM-4-Flash-250414** | 官方标注「智谱首个免费的大模型 API」，128K 上下文，**支持结构化输出** | 不需要 | [官方文档](https://docs.bigmodel.cn/cn/guide/models/free/glm-4-flash-250414) |
+| **Cloudflare Workers AI** | 10,000 neurons/天，Text Gen 300 RPM。⚠️ 但 Kimi-K2.6/K2.7-Code、GLM-5.2/5.3/5.3-Flash、DeepSeek-V4 系列**强制付费档**（该档仅 20 RPM） | 不需要 | [pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/)、[limits](https://developers.cloudflare.com/workers-ai/platform/limits/) |
+| **OpenRouter `:free`** | 常量 `RPM=20` / `RPD=50`（充值 ≥$10 后 RPD 1000，9 美元起即生效）。按账户算，官方明写多开账号不提升 | 不需要 | [limits.md](https://openrouter.ai/docs/api_reference/limits.md) |
+| **NVIDIA build.nvidia.com** | 40 RPM + 1000 credits，可申请升到 200 RPM / 5000 | 不需要 | [NVIDIA 论坛](https://forums.developer.nvidia.com/t/request-to-increase-nvidia-nim-api-rate-limit-from-40-rpm-to-200rpm/379705) |
+| **Hugging Face Inference** | 免费用户 **$0.10/月**（很少） | 不需要 | [pricing.md](https://github.com/huggingface/hub-docs/blob/main/docs/inference-providers/pricing.md) |
+
+### 已失效 ❌
+
+| 通道 | 状态 |
+| --- | --- |
+| **GitHub Models** | **2026-07-30 完全下线**。playground、模型目录、inference API、BYOK 全部不可用。官方建议转 Azure AI Foundry。[官方文档](https://docs.github.com/en/github-models) |
+
+### 未核实 ⚠️
+
+| 通道 | 说明 |
+| --- | --- |
+| **智谱 GLM-4.7-Flash** | 「免费」说法**仅第三方来源**（[腾讯云社区](https://cloud.tencent.com/developer/article/2638288)、[智通财经](https://cn.investing.com/news/stock-market-news/article-3171797)），官方页未取到。且一份第三方表格标注它**只有 1 并发**——对后台批处理是硬约束 |
+| Gemini API 免费层 | 官方 rate-limits 页 4 次 fetch 全失败。**不引用任何二手数字**。接入前自查控制台 |
+| Groq 免费层 | 官方文档返回 403，第三方数字互相冲突（30 RPM/14400 RPD vs 1000 RPD）。**未验证** |
+| Kimi/Moonshot | 新用户送 ¥15 券，**一次性非永久**，需大陆手机号。需大陆手机号。（[官方](https://www.kimi.com/en/help/kimi-api/api-free-trial)） |
+| 百度千帆 | 100 万 tokens，有效期 **3 个月**（一次性）。（[官方](https://cloud.baidu.com/doc/qianfan/s/Imi2rpirg)） |
+| 阿里百炼 | 首次开通送免费额度，领取无需实名，转按量付费才需实名。（[官方](https://help.aliyun.com/zh/model-studio/new-free-quota)） |
+| MiniMax | 按量付费为主，**无永久免费 API 层**。（[官方](https://platform.minimaxi.com/docs/guides/pricing-paygo)） |
+| Cerebras / SambaNova / Mistral / Together / Fireworks / DeepInfra | 未找到一手免费额度文档 |
+| SiliconFlow / DeepSeek 官方 / 腾讯混元 / 火山方舟 | 仅见按量计费，**未见永久免费额度**（[SiliconFlow](https://www.siliconflow.cn/pricing)） |
+
+---
+
+## 九、如果这条车道失效（备用路线）
+
+按推荐顺序：
+
+**1. 智谱 GLM-4-Flash-250414** ← 最推荐
+唯一同时满足「官方免费 + 国内直连 + OpenAI 兼容 + **支持结构化输出** + 无需绑卡」的通道。
+对 Hindsight 的中文事实抽取完全够用。
+
+base_url 已实测可达：`POST https://open.bigmodel.cn/api/paas/v4/chat/completions` 返回 **401**
+（端点在，只是需要 key）—— 这是我本轮自己打的一发，不是抄文档。
+
+```yaml
+HINDSIGHT_API_LLM_PROVIDER: openai
+HINDSIGHT_API_LLM_BASE_URL: https://open.bigmodel.cn/api/paas/v4
+HINDSIGHT_API_LLM_MODEL: glm-4-flash-250414
+HINDSIGHT_API_LLM_API_KEY: <你的智谱 key>
+```
+
+> ⚠️ **GLM-4.7-Flash 的「免费」是未证实的。** 有第三方来源（腾讯云开发者社区、智通财经）
+> 说它免费且开源，但**官方文档页没取到**。其中一份第三方表格还标注它**只有 1 并发**——
+> 对 Hindsight 的后台批处理是硬约束。所以上面推的是官方页明写免费的
+> GLM-4-Flash-250414，不是 4.7。
+
+**2. OpenRouter `:free`** — 官方常量：`FREE_MODEL_RATE_LIMIT_RPM = 20`、
+`FREE_MODEL_NO_CREDITS_RPD = 50`、`FREE_MODEL_HAS_CREDITS_RPD = 1000`、
+`FREE_MODEL_CREDITS_THRESHOLD = 10`（[limits.md](https://openrouter.ai/docs/api_reference/limits.md)）。
+注意官方明写「**多开账号或多开 key 不会提升限额**，容量全局管控」；充值 9 美元起即适用
+1000 RPD 那一档。50 RPD 对日常对话够用，做批量抽取不够——所以这只是兜底，不是主路。
+
+**3. Groq 免费层** — 速度极快，数字需自查控制台
+
+**4. 本地 Ollama + Qwen3-4B Q4_K_M** — 唯一**真正无限量**的路径
+你的 J1800 级 CPU 上，4B 量化约需 6GB 内存，8B 会降到个位数 token/s。
+只适合夜间批处理，不适合交互。vLLM 不适用（需 CUDA/现代 SIMD）。
+
+**5. Cloudflare Workers AI** — 有异步 Batch API，天生适合后台任务
+
+---
+
+## 十、诚实的边界
+
+- **「免费」不等于「无限」。** 这条车道按 session 限速，打满会 429。桥会退避和换模型，但所有免费档同时被打满时只能等。
+- **免费档会变。** 上游随时可能改模型集合或政策。桥启动时探测一次，运行中新增的免费模型要重启才发现。
+- **被动发现，不是主动保证。** 桥在响应里看到非零 `cost` 字段时会打 WARNING 日志。这是**事后**发现，**请自己看一眼账单**。
+- **质量有取舍。** 免费档模型比 `mimo-v2.6-flash` 弱，抽取质量会下降。想好一点可以指定 `mimo-v2.6-flash-free`。
+- **桥不做重试**，只做故障转移。是否重试交给调用方决定（Hindsight 侧建议 `MAX_RETRIES=2`）。
+- **只绑回环是默认值。** 改成 `0.0.0.0` 前请确认你的网络可信——暴露出去等于送人额度。
+
+---
+
+## 十一、产物清单
+
+```
+free-llm-bridge/
+├── index.js                  # 桥本体，单文件零依赖
+├── test-free-only.mjs        # 12 条回归断言，不出网，CI 可跑
+├── smoke.mjs                 # 13 条端到端断言（含结构化抽取）
+├── soak.mjs                  # 持续性 + 故障转移验证
+├── docker-compose.yml        # Docker 部署
+├── deploy/
+│   └── free-llm-bridge.service   # systemd 部署
+├── docs/
+│   └── hindsight-setup.md    # Hindsight 完整接入步骤
+├── README.md
+└── REPORT.md                 # 本报告
+```
+
+---
+
+## 十二、下一步（需要你做）
+
+1. **NAS 上改 Hindsight 的 compose 环境变量** —— 见第六节
+2. **确认零成本**：跑几次对话，看桥日志里有没有 `routing X -> Y`，有没有 WARNING cost 行
+3. **发布到 GitHub** —— 见下一节

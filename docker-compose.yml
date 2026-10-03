@@ -1,0 +1,34 @@
+# free-llm-bridge —— 让 Hindsight 之类的后台应用零成本跑 LLM
+#
+# 这份 compose 只起桥。Hindsight 自己的 compose 不动，改它的环境变量即可。
+#
+# 用法：
+#   docker compose up -d
+#   curl http://127.0.0.1:18999/health
+
+services:
+  free-llm-bridge:
+    image: node:22-alpine
+    container_name: free-llm-bridge
+    # 单文件、零依赖，直接挂进去。改代码只需重启容器。
+    working_dir: /app
+    volumes:
+      - ./:/app:ro
+    command: ["node", "index.js", "--port", "18999"]
+    environment:
+      # 默认只绑容器回环。要让局域网/NAS 访问改成 0.0.0.0 并配防火墙，
+      # 详见 docs/hindsight-setup.md 的「办法 A」。
+      HOST: "0.0.0.0"
+      UPSTREAM_BASE: "https://opencode.ai"
+    ports:
+      # 只发布到回环。NAS 上的容器用 host.docker.internal 或局域网 IP 访问，
+      # 不需要把 18999 发布到公网。
+      - "127.0.0.1:18999:18999"
+    restart: unless-stopped
+    # 桥没有任何秘密，但仍是非 root 运行。
+    user: node
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

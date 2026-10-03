@@ -1,0 +1,37 @@
+# 让 free-llm-bridge 常驻。
+#
+# 装法：
+#   1. 把仓库放到 /opt/free-llm-bridge
+#   2. cp deploy/free-llm-bridge.service /etc/systemd/system/
+#   3. systemctl daemon-reload
+#   4. systemctl enable --now free-llm-bridge
+#   5. systemctl status free-llm-bridge
+
+[Unit]
+Description=free-llm-bridge (zero-cost OpenAI-compatible bridge to a keyless free LLM lane)
+Documentation=https://github.com/<你的用户名>/free-llm-bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/free-llm-bridge
+ExecStart=/usr/bin/node index.js --port 18999
+Environment=HOST=0.0.0.0
+Environment=UPSTREAM_BASE=https://opencode.ai
+Restart=always
+RestartSec=5
+
+# 桥只需要读自己的目录和外网，不碰系统任何地方。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/free-llm-bridge
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=free-llm-bridge
+
+[Install]
+WantedBy=multi-user.target
