@@ -221,7 +221,7 @@ node scripts/cost-analysis.mjs [hindsightUrl] [bankId]
 environment:
   HINDSIGHT_API_LLM_PROVIDER: openai
   # ⚠️ 填**跑桥那台机器的局域网 IP**
-  HINDSIGHT_API_LLM_BASE_URL: http://192.168.31.21:18999/v1
+  HINDSIGHT_API_LLM_BASE_URL: http://192.168.1.10:18999/v1
   HINDSIGHT_API_LLM_API_KEY: local
   HINDSIGHT_API_LLM_MODEL: space-bunny-free
 ```

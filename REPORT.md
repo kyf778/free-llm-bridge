@@ -108,7 +108,7 @@ x-opencode-project: global
 > 我实测验证了这一点：第一次直接 curl 上游时**每次请求现造一个随机 session**，连发两次，本该好用的 `mimo-v2.6-flash-free` 就被限流了。换成稳定 session 后一切正常。
 
 **4. 地区门**（`403 RegionError`）
-部分模型对某些出口 IP 直接拒绝。实测你的 CN 出口（`59.175.124.94`）下
+部分模型对某些出口 IP 直接拒绝。实测本次测试所用的 CN 出口 IP 下
 `muse-spark-1.3-contributor-free` 和 `1.2` 被挡。
 
 ### 实测清单 —— 重要更正
@@ -360,7 +360,7 @@ environment:
   # ── 必改：4 个环节统一指向桥 ─────────────────────────────
   HINDSIGHT_API_LLM_PROVIDER: openai
   # ⚠️ 填**跑桥那台机器的局域网 IP**（桥与 Hindsight 不同机器时）
-  HINDSIGHT_API_LLM_BASE_URL: http://192.168.31.21:18999/v1
+  HINDSIGHT_API_LLM_BASE_URL: http://192.168.1.10:18999/v1
   HINDSIGHT_API_LLM_API_KEY: local
   HINDSIGHT_API_LLM_MODEL: space-bunny-free
 
@@ -384,13 +384,13 @@ environment:
 - **建议关思考。** 思考 token 与正文抢同一份额度，对「只要结论」的记忆提取纯浪费。
   你原来就用 `HINDSIGHT_API_LLM_EXTRA_BODY` 关掉了，这里保留同样的字段名即可。
 - **⚠️ `BASE_URL` 里的地址取决于桥和 Hindsight 是不是同一台机器。**
-  你的情况是**不同机器**（桥在电脑 `192.168.31.21`，Hindsight 在 NAS `192.168.31.123`），
+  你的情况是**不同机器**（桥在电脑 `192.168.1.10`，Hindsight 在 NAS `192.168.1.20`），
   所以桥必须绑 `HOST=0.0.0.0`，`BASE_URL` 填**桥那台机器的局域网 IP**。
   `host.docker.internal` 在这里**是错的**——它指向 NAS 自己的宿主机。
 
   实测两种绑定的差别：
 
-  | 桥的绑定 | 从 `192.168.31.21:18999` 访问 |
+  | 桥的绑定 | 从 `192.168.1.10:18999` 访问 |
   | --- | --- |
   | 默认 `127.0.0.1` | ❌ 不可达（`netstat` 显示只 LISTEN 在 `127.0.0.1:18999`） |
   | `HOST=0.0.0.0` | ✅ `HTTP 200`，模型正常返回 `LAN_OK` |

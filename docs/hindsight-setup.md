@@ -6,27 +6,26 @@
 ## 架构
 
 ```text
-                         ┌──────────────────────────────────────┐
-  飞牛 NAS  192.168.31.123                                  │
-  ┌──────────┐           │  Hindsight 容器（ghcr.io/vectorize-io│
-  │ hindsight│  :8888    │            /hindsight）               │
-  │  容器    │◄──────────┤  retain / reflect / consolidation /   │
-  └──────────┘           │  mental-model refresh                │
-        ▲                └────────────┬─────────────────────────┘
-        │                             │  OpenAI 兼容 HTTP
-        │                             │  ⚠️ 必须用跑桥那台机器的**局域网 IP**
-        │                             │     不能用 host.docker.internal
-        │                ┌────────────▼─────────────────────────┐
-        │  你的电脑 192.168.31.21                                │
-        └────────────────│  free-llm-bridge（单文件 Node 服务）   │
-          局域网访问 :18999 ◄─────┤  会话亲和 · 指纹门 · 多车道转移  │
-                        └────────────┬─────────────────────────┘
-                                     │  Authorization: Bearer public
-                        ┌────────────▼─────────────────────────┐
-                        │  OpenCode Zen 免密车道（零成本）      │
-                        │  86 个模型，13 个 `-free`             │
-                        │  同一时刻 1 个可直连，其余限流待恢复  │
-                        └──────────────────────────────────────┘
+  飞牛 NAS  192.168.1.20
+  ┌──────────┐
+  │ hindsight│  :8888
+  │  容器    │◄───────────────────────────┐
+  └──────────┘                            │
+                                retain / reflect / consolidation /
+                                mental-model refresh
+                                             │  OpenAI 兼容 HTTP
+                                             │  ⚠️ 必须用跑桥那台机器的局域网 IP
+                                             │     不能用 host.docker.internal
+                          ┌──────────────────▼─────────────────────┐
+  你的电脑  192.168.1.10  │  free-llm-bridge（单文件 Node 服务）    │
+  局域网访问 :18999 ─────►│  会话亲和 · 指纹门 · 多车道故障转移     │
+                          └──────────────────┬─────────────────────┘
+                                             │  Authorization: Bearer public
+                          ┌──────────────────▼─────────────────────┐
+                          │  OpenCode Zen 免密车道（零成本）       │
+                          │  86 个模型，13 个 `-free`              │
+                          │  同一时刻 1 个可直连，其余限流待恢复   │
+                          └────────────────────────────────────────┘
 ```
 
 **关键点：桥和 Hindsight 在不同的机器上。** 所以：
@@ -35,7 +34,7 @@
 2. 不要把桥装进 Hindsight 容器里——桥需要能独立于 Hindsight 存活；
 3. `host.docker.internal` 在这里**无效**（它指向 NAS 自己，不是你的电脑）。
 
-> 这一步实测过：桥绑回环时 `192.168.31.21:18999` 不可达；改成 `0.0.0.0` 后
+> 这一步实测过：桥绑回环时 `192.168.1.10:18999` 不可达；改成 `0.0.0.0` 后
 > 同一个地址返回 `HTTP 200` 且模型正常返回 `LAN_OK`。
 
 ## 第一步：把桥跑起来
@@ -100,14 +99,14 @@ node index.js --port 18999
 `HOST=0.0.0.0` 表示监听所有网卡。实测这一步之后，从局域网 IP 访问就通了：
 
 ```
-192.168.31.21:18999/health -> HTTP 200
+192.168.1.10:18999/health -> HTTP 200
 模型 space-bunny-free 返回 LAN_OK
 ```
 
 然后 **Hindsight 的 `BASE_URL` 填跑桥那台机器的局域网 IP**：
 
 ```yaml
-HINDSIGHT_API_LLM_BASE_URL: http://192.168.31.21:18999/v1
+HINDSIGHT_API_LLM_BASE_URL: http://192.168.1.10:18999/v1
 ```
 
 **必须做的两件安全收尾**（暴露到局域网不是小事）：
@@ -116,7 +115,7 @@ HINDSIGHT_API_LLM_BASE_URL: http://192.168.31.21:18999/v1
 
    ```powershell
    New-NetFirewallRule -DisplayName "free-llm-bridge" -Direction Inbound `
-     -Protocol TCP -LocalPort 18999 -RemoteAddress 192.168.31.0/24 -Action Allow
+     -Protocol TCP -LocalPort 18999 -RemoteAddress 192.168.1.0/24 -Action Allow
    ```
 
 2. **给桥加一个自己的 key。** 桥默认接受任意非空 `Authorization`（面向本机自用）。
@@ -160,7 +159,7 @@ environment:
   # ── 4 个环节统一指向桥 ──────────────────────────────────────
   # ⚠️ BASE_URL 填**跑桥那台机器的局域网 IP**，不是 host.docker.internal
   HINDSIGHT_API_LLM_PROVIDER: openai
-  HINDSIGHT_API_LLM_BASE_URL: http://192.168.31.21:18999/v1
+  HINDSIGHT_API_LLM_BASE_URL: http://192.168.1.10:18999/v1
   HINDSIGHT_API_LLM_API_KEY: local
   HINDSIGHT_API_LLM_MODEL: space-bunny-free
 

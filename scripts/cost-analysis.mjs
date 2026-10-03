@@ -9,7 +9,8 @@
  *   node scripts/cost-analysis.mjs [hindsightBaseUrl] [bankId]
  */
 
-const HINDSIGHT = process.argv[2] || process.env.HINDSIGHT_URL || 'http://192.168.31.123:8888'
+// 默认值是**示例**，请换成你自己的 Hindsight 地址（它只读，不改任何东西）。
+const HINDSIGHT = process.argv[2] || process.env.HINDSIGHT_URL || 'http://192.168.1.20:8888'
 const BANK = process.argv[3] || process.env.HINDSIGHT_BANK || 'coding-agent::default-workspace'
 const BANK_PATH = `${HINDSIGHT}/v1/default/banks/${encodeURIComponent(BANK)}`
 

@@ -4,12 +4,15 @@
 
 ## 现状
 
-仓库已经 `git init` 并提交了 2 个 commit。本地 git 身份是：
+仓库已经 `git init` 并提交。**发之前先确认提交身份**：
 
-- name: `kyf`
-- email: `694982318@qq.com`
+```bash
+git log -1 --format='%an <%ae>'
+```
 
-⚠️ 这两个值**已经进了 commit 历史**，发之前想改还来得及（见下面第 3 步）。
+⚠️ 如果这里显示的不是你想公开的昵称与邮箱，现在改还来得及——但**已经 commit 过的
+author 需要重写历史**，见下面第 3 步。想省事就用 GitHub 的隐私邮箱
+`<你的昵称>@users.noreply.github.com`，它不会暴露真实邮箱。
 
 ## 1. 注册 / 登录 GitHub
 
@@ -42,12 +45,12 @@ cd <这个项目的路径>
 git log -1 --format='%an <%ae>'
 ```
 
-想换成你的 GitHub 昵称和邮箱（比如 `kyf@users.noreply.github.com`，
-这是 GitHub 提供的隐私邮箱）：
+想换成你的 GitHub 昵称和隐私邮箱（`<你的昵称>@users.noreply.github.com`，
+GitHub 提供的、不会暴露真实邮箱的那个）：
 
 ```powershell
 git config user.name "你的昵称"
-git config user.email "你的GitHub邮箱"
+git config user.email "你的昵称@users.noreply.github.com"
 ```
 
 已经提交了还想改历史（**只有还没 push 时才做**）：
