@@ -9,7 +9,7 @@
 - 零依赖、单文件，只需要 Node `>= 22.19`
 - **不需要 API key、不需要注册、不需要充值**
 - 只服务免费档模型：付费模型被点名时直接 400 拒绝，绝不静默改投
-- 一个模型被限流，自动换到下一个免费档继续跑
+- **支持多条车道**：一条限流/连不上自动换下一条，可扩展
 - 会话亲和，让免费额度按会话计而不是按请求计
 
 ```bash
@@ -26,6 +26,56 @@ node index.js
 | `base_url` | `http://127.0.0.1:18999/v1` |
 | `api_key` | `local`（任意非空字符串，桥不使用它） |
 | `model` | `space-bunny-free`（或 `/v1/models` 里任何一个） |
+
+---
+
+## 多车道：把单点变成可扩展
+
+**默认只有一条车道（免密的 OpenCode Zen），而它实测只有一个模型能用——也就是说开箱即用是单点。**
+这个模型被打满，整条路线就停。所以第二条车道不是锦上添花，是这条路线的可用性下限。
+
+用环境变量 `LANES` 加，不用改代码：
+
+```bash
+# 智谱 GLM-4-Flash-250414，官方页明写「智谱首个免费的大模型 API」
+# https://docs.bigmodel.cn/cn/guide/models/free/glm-4-flash-250414
+export LANES='[
+  {"name":"glm","baseUrl":"https://open.bigmodel.cn/api/paas/v4",
+   "model":"glm-4-flash-250414","apiKey":"你的免费key"},
+  {"name":"zen","baseUrl":"https://opencode.ai","model":"space-bunny-free",
+   "headers":{"user-agent":"opencode/1.18.31","x-opencode-client":"desktop"},
+   "fingerprintTools":true,"sessionScoped":true,"normalizeSchema":true,"strictSchema":true}
+]'
+node index.js
+```
+
+⚠️ **配了 `LANES` 就不再自动带内置免密车道**——你配什么就是什么。
+需要两条都用就把 `zen` 也一起写进去（像上面那样）。
+
+每条车道的字段：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `name` | ✅ | 出现在日志与 `/health` 里 |
+| `baseUrl` | ✅ | 到 `/chat/completions` 的前缀 |
+| `model` | ✅ | **必须是确认免费的那一档**。填错付费模型名 = 静默把账单接回去 |
+| `apiKey` | | 不填则用 `Bearer public` |
+| `headers` | | 该家要求的额外请求头 |
+| `sessionScoped` | | true 才发 `x-opencode-session`（按 session 计额的才需要） |
+| `fingerprintTools` | | true 才补 `bash/glob/grep/read` 四件套 |
+| `strictSchema` | | true 才发 `response_format`（不支持的会 400） |
+| `normalizeSchema` | | true 才剥掉 nullable 联合类型 |
+| `pathStyle` | | `"openai"` 表示标准 `/chat/completions`；省略则按模型分流 |
+
+`/health` 逐条报出每辆车道还有没有容量：
+
+```bash
+curl -s localhost:18999/health | jq '.lanes'
+```
+
+故障转移顺序：**先在同一条车道内换模型**（凭据、能力、schema 策略都不变），
+**换不动了再换车道**。每个 `lane:model` 最多被打一次，总跳数有上限，不会打转。
+触发条件：限流 429、凭据失效 401/403、传输层连不上、以及 opencode-only 403。
 
 ---
 
@@ -127,13 +177,21 @@ function isFreeModel(model) {
 ## 测试
 
 ```bash
-node test-free-only.mjs   # 零成本保证 + 会话亲和 + 指纹门 + 文档一致性。不出网，秒级
+node test-free-only.mjs   # 零成本保证 + 会话亲和 + 指纹门 + schema 规整 + 文档一致性。不出网，秒级
+node test-multilane.mjs   # 多车道故障转移。起两个本地假上游，不出网，秒级
 node smoke.mjs            # 端到端。真打上游，会消耗免费额度
 node soak.mjs             # 持续性 + 故障转移。真打上游
 ```
 
-`test-free-only.mjs` 不出网，可以在 CI 里跑。`smoke.mjs` 会真实调用上游，包括一个
-结构化 JSON 抽取用例——那正是 Hindsight retain 做的事。
+前两套不出网，可以在 CI 里跑。
+
+`test-multilane.mjs` 值得单独说一句：**多车道逻辑没法只靠真实上游验证**，
+因为真实免密车道只有一个模型能用，主车道限流之后根本没有第二条真实车道可换。
+所以它起两个本地假上游，按剧本返回 429 / 401 / 连不上，断言调用方看到的是**一次成功**
+而不是一次错误。同时它检查每条车道的标志真的按车道生效——备用车道确实没收到
+`response_format` 与四件套诱饵，主车道确实收到了。
+
+`smoke.mjs` 会真实调用上游，包括一个结构化 JSON 抽取用例——那正是 Hindsight retain 做的事。
 
 其中有一条**文档一致性断言**：README 的 API 表格里写的每个端点，必须在 `index.js` 里
 真的有对应路由。这条是为一个真实缺陷写的——README 曾经列出 `POST /v1/responses`，
@@ -187,13 +245,17 @@ environment:
 > 这一节请认真读。这个项目最容易被误解的地方全在这里，而且**大部分结论都是我实测出来的，
 > 不是从上游文档或插件 README 抄的**——两者在关键一点上不一致（见下）。
 
-- **⚠️ 只有一个模型真能直连用。** 13 个 `-free` 里，`space-bunny-free` 可用；
+- **⚠️ 开箱即用是单点。** 13 个 `-free` 里只有 `space-bunny-free` 能第三方直连；
   `fledge-alpha-free`、`nemotron-3-ultra-free`、`nemotron-3.5-lightning-free`、
   `longcat-2.5-preview-free` 一律 403 `OpenCode's free tier can only be used from
   within OpenCode`——上游按**调用来源**限制，不按请求头（`space-bunny-free` 不带任何
   指纹头也能成功）。桥会把这 4 个移出候选池，并在遇到它们时自动换档。
-  **代价是：故障转移的候选池实际上只有一项**，限流时没有第二个真正可用的模型可换。
-  这是这条路线的真实上限，不是可以靠配置绕过的。
+  **它被打满时，桥会如实回 429 并建议加车道**——这才是单点的真实样子。
+  要消掉这个单点，见上面的「多车道」。
+- **故障转移是有序且有界的。** 先同车道换模型，再换车道；每个 `lane:model` 最多一次，
+  总跳数上限 `MAX_FAILOVER_HOPS`（默认 16）。实测主车道 7 个候选全挂时，
+  桥一次请求打 7 次上游然后交给备用车道——不会打转，但也确实试了 7 次。
+  想更快放弃可以调小它。
 - **插件的探测结果会骗人。** `dsh-our-free-model` 的设置页显示那些模型「available」，
   但那是它在 DSH 进程里探测的——上游把它当成 OpenCode 内部流量。**第三方工具照抄这个
   清单会踩空。** 想确认就自己跑 `node scripts/probe-free-models.mjs`。

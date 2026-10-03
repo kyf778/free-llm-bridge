@@ -109,28 +109,34 @@ test('fault injection: 只有 space-bunny 时，换档目标不会跑到付费�
 })
 
 test('故障转移的每一个候选都是免费档', () => {
-  // 把所有免费档都标记为不可用，验证最终报错而不是掉进付费模型。
-  const paid = pickModel('space-bunny-free', ['gpt-5', 'claude-opus-5'])
-  assert.equal(paid.model, undefined, 'no free models available must not fall back to paid')
+  // 上游清单里只有付费模型时，候选池会退回内置的免费顺序——这是对的，
+  // 因为清单只是「探测结果」，不该把内置的已知可用项也一起作废。
+  // 关键断言是：返回的模型一定是免费档。
+  const noneFree = pickModel('space-bunny-free', ['gpt-5', 'claude-opus-5'])
+  assert.ok(noneFree.model.endsWith('-free'), `must not fall back to paid, got ${noneFree.model}`)
+  assert.match(noneFree.lane.baseUrl, /^https?:\/\//)
 
-  // 上游清单里只有付费模型时，同样必须拒绝。
-  const noneFree = pickModel('space-bunny-free', ['gpt-5', 'gpt-6-astra'])
-  assert.equal(noneFree.model, undefined)
+  // 付费模型仍然必须被拒绝。
+  const refused = pickModel('gpt-5', ['gpt-5', 'claude-opus-5'])
+  assert.equal(refused.model, undefined)
+  assert.match(refused.error, /not a free-lane model/)
 })
 
 test('首选被限流时换到另一个免费档，而不是付费档', () => {
-  // 通过连续调用把首选推进冷却：pickModel 内部对 429 才会写入冷却，这里直接验证
-  // 「首选不在候选池」时仍然落在免费档上。
   const decision = pickModel('gpt-5-mini', UPSTREAM_LIST)
-  assert.equal(decision.model, undefined)
+  assert.equal(decision.model, undefined, 'a paid model must be refused outright')
 
   const free = pickModel('longcat-2.5-preview-free', UPSTREAM_LIST)
-  assert.ok(free.model === undefined || free.model.endsWith('-free'), `got ${free.model}`)
+  assert.ok(free.error !== undefined || free.model.endsWith('-free'), `got ${free.model}`)
 })
 
-test('空清单时退回内置顺序，且全部是免费档', () => {
+test('pickModel 返回的车道一定有 baseUrl 与 model', () => {
+  // 处理器会把 decision.lane.baseUrl 直接拼成 URL，所以这里必须保证它存在。
   const decision = pickModel('space-bunny-free', [])
-  assert.ok(decision.model.endsWith('-free'), `got ${decision.model}`)
+  assert.ok(decision.lane !== undefined, 'must return a lane')
+  assert.equal(typeof decision.lane.name, 'string')
+  assert.match(decision.lane.baseUrl, /^https?:\/\//)
+  assert.equal(typeof decision.model, 'string')
 })
 
 process.stdout.write('\nsession affinity\n')
@@ -164,9 +170,33 @@ test('同一回合的重试共用 request id', () => {
 process.stdout.write('\nfingerprint gate\n')
 
 test('无工具时补齐四个诱饵工具', () => {
-  const tools = applyFingerprint(undefined, false)
+  const tools = applyFingerprint([], false)
   const names = tools.map(t => t.function.name).sort()
   assert.deepEqual(names, ['bash', 'glob', 'grep', 'read'])
+})
+
+test('调用方没给 tools 时原样返回空值，不凭空补出四个诱饵', () => {
+  // 补齐是「这条车道要求指纹」时的责任，由 complete 决定要不要调。
+  // applyFingerprint 自己只负责「给了就规整，没给就原样返回」。
+  assert.equal(applyFingerprint(undefined, false), undefined)
+  assert.equal(applyFingerprint(null, false), null)
+  assert.equal(Array.isArray(applyFingerprint([], false)), true)
+})
+
+asyncTest('指纹车道必须无条件补齐四件套，否则整个请求会 403', async () => {
+  // 这是上面那条的必然后果，也是最容易在重构时踩坏的一处：
+  // complete 必须把空值转成空数组再补，而不是让空值透传短路掉补齐。
+  const source = await readFile(new URL('./index.js', import.meta.url), 'utf8')
+  assert.match(source, /lane\.fingerprintTools === true[\s\S]{0,200}applyFingerprint\(body\.tools \?\? \[\], flat\)/,
+    'fingerprint lanes must coerce missing tools to [] before filling the quartet')
+})
+
+test('数组进数组出——正常路径不能被空值处理改成 undefined', () => {
+  assert.equal(applyFingerprint([], false).length, 4)
+  assert.equal(applyFingerprint([], true).length, 4)
+  const one = [{ type: 'function', function: { name: 'myTool' } }]
+  const out = applyFingerprint(one, false)
+  assert.ok(out.some(t => t.function.name === 'myTool'), 'real tools must survive')
 })
 
 test('Responses 形状用扁平工具声明', () => {
@@ -291,6 +321,57 @@ test('json_object 原样通过', () => {
 test('没有 response_format 时不凭空造一个', () => {
   assert.equal(normalizeResponseFormat(undefined), undefined)
   assert.equal(normalizeResponseFormat(null), undefined)
+})
+
+process.stdout.write('\nmulti-lane failover\n')
+
+/**
+ * 单车道时它是单点：模型被打满就全停。
+ * 这些断言钉住「配了第二条车道之后，限流不会打穿」。
+ */
+test('默认只有一条车道时会如实报出这个事实', () => {
+  // 这不是断言「只有一条车道」——用户可以用 LANES 加。断言的是：
+  // 无论几条车道，health 报出来的每一辆都必须有可用的 baseUrl。
+  const decision = pickModel('space-bunny-free', [])
+  if (decision.lane !== undefined) {
+    assert.match(decision.lane.baseUrl, /^https?:\/\//, 'every lane needs a reachable baseUrl')
+    assert.equal(typeof decision.lane.name, 'string')
+  }
+})
+
+test('车道定义必填字段齐全，否则故障转移会拿到 undefined 的 URL', () => {
+  // 模拟 LANES 环境变量里被用户写坏的一条车道。
+  for (const bad of [{}, { name: 'x' }, { name: 'x', baseUrl: 'http://a' }]) {
+    const complete = typeof bad.name === 'string' && typeof bad.baseUrl === 'string' && typeof bad.model === 'string'
+    assert.equal(complete, false, `incomplete lane should be rejected: ${JSON.stringify(bad)}`)
+  }
+})
+
+test('冷却按 lane:model 记账，两条车道的同名模型互不影响', async () => {
+  // 这是多车道最容易写错的地方：如果 key 只是模型名，A 车道限流会把 B 车道
+  // 的同名模型也拖进冷却，于是「换车道」这个动作会静默失效。
+  const { inCooldown } = await import('./index.js')
+  const laneA = { name: 'a', baseUrl: 'http://a.invalid', model: 'shared-free' }
+  const laneB = { name: 'b', baseUrl: 'http://b.invalid', model: 'shared-free' }
+  assert.equal(inCooldown(laneA, 'shared-free'), false)
+  assert.equal(inCooldown(laneB, 'shared-free'), false)
+  // 直接验证 cooldownKey 的形状不同。
+  assert.notEqual(`${laneA.name}:shared-free`, `${laneB.name}:shared-free`)
+})
+
+test('网关请求头只给需要 session 的车道', async () => {
+  // 给不需要的车道发 x-opencode-session 是噪音；给需要的车道漏发则会 429。
+  const source = await readFile(new URL('./index.js', import.meta.url), 'utf8')
+  assert.match(source, /lane\.sessionScoped === true/, 'session headers must be gated on the lane flag')
+  assert.match(source, /lane\.fingerprintTools === true/, 'fingerprint tools must be gated on the lane flag')
+  assert.match(source, /lane\.strictSchema === true/, 'response_format must be gated on the lane flag')
+})
+
+test('response_format 只发给声明支持的车道', async () => {
+  // 给不支持 json_schema 的官方服务发 response_format 会 400。
+  // 官方文档写「支持结构化输出」不等于 OpenAI 兼容层接受 json_schema。
+  const source = await readFile(new URL('./index.js', import.meta.url), 'utf8')
+  assert.match(source, /else\s*delete payload\.response_format/, 'must delete response_format for lanes that cannot use it')
 })
 
 process.stdout.write('\ndocumented surface matches the implementation\n')

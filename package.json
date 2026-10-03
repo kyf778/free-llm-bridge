@@ -1,0 +1,37 @@
+{
+  "name": "free-llm-bridge",
+  "version": "0.2.0",
+  "description": "把免密免费 LLM 车道接给任意 OpenAI 兼容应用（多车道、零成本、故障转移）",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "free-llm-bridge": "index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test": "node test-free-only.mjs && node test-multilane.mjs",
+    "test:offline": "node test-free-only.mjs && node test-multilane.mjs",
+    "test:live": "node smoke.mjs",
+    "test:soak": "node soak.mjs",
+    "typecheck": "node --check index.js"
+  },
+  "keywords": [
+    "llm",
+    "openai-compatible",
+    "proxy",
+    "free-tier",
+    "failover",
+    "hindsight",
+    "self-hosted"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "files": [
+    "index.js",
+    "README.md",
+    "REPORT.md",
+    "LICENSE"
+  ]
+}
