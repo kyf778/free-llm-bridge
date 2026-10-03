@@ -3,3 +3,6 @@ node_modules/
 .DS_Store
 .env
 .env.*
+
+# 临时 commit message 文件（用 git commit -F 传多行中文时用）
+*_TMP.txt
