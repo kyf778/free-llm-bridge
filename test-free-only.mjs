@@ -10,9 +10,16 @@
  */
 
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import { pickModel, applyFingerprint, sessionForConversation, requestIdFor } from './index.js'
 
 let failures = 0
+
+/**
+ * 同步断言用这个。
+ * @param {string} name 断言名
+ * @param {() => void} fn 断言体，抛错即失败
+ */
 function test(name, fn) {
   try {
     fn()
@@ -21,6 +28,29 @@ function test(name, fn) {
     failures += 1
     process.stdout.write(`  FAIL  ${name}\n        ${error.message}\n`)
   }
+}
+
+const pending = []
+
+/**
+ * 异步断言挂到这里，统一在末尾 await。
+ *
+ * 文档一致性那两条要读文件，所以是异步的。把它们塞进同步的 `test()` 里会得到一个
+ * 永不 reject 的悬空 Promise——测试会「通过」而实际上什么都没检查。
+ *
+ * @param {string} name 断言名
+ * @param {() => Promise<void>} fn 断言体
+ */
+function asyncTest(name, fn) {
+  pending.push(
+    fn().then(
+      () => process.stdout.write(`  PASS  ${name}\n`),
+      error => {
+        failures += 1
+        process.stdout.write(`  FAIL  ${name}\n        ${error.message}\n`)
+      },
+    ),
+  )
 }
 
 /** 上游清单（2026-10-05 实测 86 条）里同时有付费与免费档，这里钉住过滤行为。 */
@@ -124,6 +154,54 @@ test('大小写重复被规范化成一个，不重复声明', () => {
   const names = tools.filter(t => FINGERPRINT_NAMES.has(t.function?.name)).map(t => t.function.name)
   assert.equal(names.filter(n => n === 'bash').length, 1, 'must not declare bash twice')
 })
+
+process.stdout.write('\ndocumented surface matches the implementation\n')
+
+/**
+ * README 曾经列出 `POST /v1/responses`，而实现里根本没有这条路由。
+ * 文档承诺了代码不做的事——这就是下面这条断言要挡的。
+ * 改 README 或改路由时，两边必须同时动，这条断言会当场变红。
+ */
+asyncTest('README 承诺的端点都真实存在', async () => {
+  const readme = await readFile(new URL('./README.md', import.meta.url), 'utf8')
+  // 从 README 的 API 表格里抓出「方法 + 路径」两列。
+  const documented = [...readme.matchAll(/\|\s*`(GET|POST)`\s*\|\s*`(\/[^`]*)`/g)]
+    .map(m => `${m[1]} ${m[2].replace(/\/$/, '')}`)
+  assert.ok(documented.length >= 3, `README should document at least 3 endpoints, found ${documented.length}`)
+
+  const source = await readFile(new URL('./index.js', import.meta.url), 'utf8')
+  for (const entry of documented) {
+    const [method, path] = entry.split(' ')
+    // 路由判断在代码里有两种写法：把 method 和 path 写在同一个条件里
+    // （`req.method === 'GET' && path === '/v1/models'`），或者把 path 写成
+    // 一组 `||` 分支（`path === '/' || path === '/health'`）而 method 单独判。
+    // 只按「method 紧邻 path」的写法去匹配会把第二种合法写法误判成缺失，
+    // 所以这里分两种形态各自放行，但要求 path 字面量确实出现在路由分发里。
+    const quoted = `'${escapeRe(path)}'`
+    const pathIsRouted = source.includes(quoted) ||
+      new RegExp(`path === ${quoted}`).test(source)
+    assert.ok(pathIsRouted, `README documents ${method} ${path} but the path is not routed in index.js`)
+    assert.ok(
+      new RegExp(`req\\.method === '${method}'`).test(source),
+      `README documents ${method} ${path} but index.js never checks that method`,
+    )
+  }
+})
+
+asyncTest('README 没有承诺未实现的 Responses 端点', async () => {
+  const readme = await readFile(new URL('./README.md', import.meta.url), 'utf8')
+  const source = await readFile(new URL('./index.js', import.meta.url), 'utf8')
+  const advertised = /\|\s*`POST`\s*\|\s*`(\/v1\/responses)`/.test(readme)
+  const implemented = /path === '\/v1\/responses'/.test(source)
+  assert.equal(advertised, implemented,
+    'README and code disagree about /v1/responses — update whichever changed')
+})
+
+function escapeRe(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+await Promise.all(pending)
 
 process.stdout.write(`\n${failures === 0 ? 'ALL CHECKS PASSED' : `${failures} CHECK(S) FAILED`}\n`)
 process.exit(failures === 0 ? 0 : 1)

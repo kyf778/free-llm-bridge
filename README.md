@@ -98,7 +98,10 @@ function isFreeModel(model) {
 | `GET` | `/health` | 存活探针，无需 key |
 | `GET` | `/v1/models` | 只列免费档模型 |
 | `POST` | `/v1/chat/completions` | 流式与非流式 |
-| `POST` | `/v1/responses` | Responses 形状（未做完整工具转换，按需补） |
+
+> `/v1/responses` **没有实现**。上游确实有 `/zen/v1/responses` 这条线（`muse-spark-*`
+> 系列走它），但桥目前只暴露 chat/completions。Hindsight 用的是 chat/completions，
+> 所以不影响本项目的目标场景。要用 Responses 形状的客户端请开 issue。
 
 非 `/health` 的路由都接受任意非空 `Authorization`——本地自用没有会话，桥不校验它。
 **如果你要把桥暴露到局域网，请自己在前面加一层认证**，或至少用防火墙限制来源。
@@ -115,12 +118,26 @@ function isFreeModel(model) {
 ## 测试
 
 ```bash
-node test-free-only.mjs   # 零成本保证 + 会话亲和 + 指纹门。不出网，秒级
+node test-free-only.mjs   # 零成本保证 + 会话亲和 + 指纹门 + 文档一致性。不出网，秒级
 node smoke.mjs            # 端到端。真打上游，会消耗免费额度
+node soak.mjs             # 持续性 + 故障转移。真打上游
 ```
 
 `test-free-only.mjs` 不出网，可以在 CI 里跑。`smoke.mjs` 会真实调用上游，包括一个
 结构化 JSON 抽取用例——那正是 Hindsight retain 做的事。
+
+其中有一条**文档一致性断言**：README 的 API 表格里写的每个端点，必须在 `index.js` 里
+真的有对应路由。这条是为一个真实缺陷写的——README 曾经列出 `POST /v1/responses`，
+而实现里根本没有这条路由。文档承诺了代码不做的事，后来加了断言把两者钉在一起。
+
+### 量一下你省了多少钱
+
+```bash
+node scripts/cost-analysis.mjs [hindsightUrl] [bankId]
+```
+
+从 Hindsight 自己的 `/llm-requests` 接口读真实用量，按单价换算成钱，并与免费方案对比。
+只读，不改任何东西。某个真实部署的实测：改造前 ¥10.87/天（约 ¥2154/年），改造后 ¥0。
 
 ---
 
