@@ -9,10 +9,13 @@
   },
   "scripts": {
     "start": "node index.js",
-    "test": "node test-free-only.mjs && node test-multilane.mjs",
-    "test:offline": "node test-free-only.mjs && node test-multilane.mjs",
+    "test": "node test-free-only.mjs && node test-multilane.mjs && node test-degradation.mjs",
+    "test:offline": "node test-free-only.mjs && node test-multilane.mjs && node test-degradation.mjs",
     "test:live": "node smoke.mjs",
     "test:soak": "node soak.mjs",
+    "probe:free-models": "node scripts/probe-free-models.mjs",
+    "probe:keyless": "node scripts/probe-keyless.mjs",
+    "probe:cost": "node scripts/cost-analysis.mjs",
     "typecheck": "node --check index.js"
   },
   "keywords": [

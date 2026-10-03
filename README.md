@@ -179,11 +179,12 @@ function isFreeModel(model) {
 ```bash
 node test-free-only.mjs   # 零成本保证 + 会话亲和 + 指纹门 + schema 规整 + 文档一致性。不出网，秒级
 node test-multilane.mjs   # 多车道故障转移。起两个本地假上游，不出网，秒级
+node test-degradation.mjs # 全部车道不可用时的降级行为。不出网，秒级
 node smoke.mjs            # 端到端。真打上游，会消耗免费额度
 node soak.mjs             # 持续性 + 故障转移。真打上游
 ```
 
-前两套不出网，可以在 CI 里跑。
+前三条都不出网，`npm test` 会依次跑完，可以在 CI 里跑。
 
 `test-multilane.mjs` 值得单独说一句：**多车道逻辑没法只靠真实上游验证**，
 因为真实免密车道只有一个模型能用，主车道限流之后根本没有第二条真实车道可换。
@@ -191,7 +192,11 @@ node soak.mjs             # 持续性 + 故障转移。真打上游
 而不是一次错误。同时它检查每条车道的标志真的按车道生效——备用车道确实没收到
 `response_format` 与四件套诱饵，主车道确实收到了。
 
-`smoke.mjs` 会真实调用上游，包括一个结构化 JSON 抽取用例——那正是 Hindsight retain 做的事。
+`test-degradation.mjs` 盯的是「零成本」的**危险失败模式**：不是不停地失败（那看得见），
+而是**假装成功**。实测发现上游在 `json_schema` 不带 `strict` 时会回 200 但 content 为空——
+放过它的话，Hindsight 的 retain 会「成功」地抽出零条事实，记忆看起来在工作，
+实际什么都没存，且没有任何地方报错。桥现在把空完成降级成一次明确失败，
+让它走故障转移或如实上报。
 
 其中有一条**文档一致性断言**：README 的 API 表格里写的每个端点，必须在 `index.js` 里
 真的有对应路由。这条是为一个真实缺陷写的——README 曾经列出 `POST /v1/responses`，
@@ -245,13 +250,17 @@ environment:
 > 这一节请认真读。这个项目最容易被误解的地方全在这里，而且**大部分结论都是我实测出来的，
 > 不是从上游文档或插件 README 抄的**——两者在关键一点上不一致（见下）。
 
-- **⚠️ 开箱即用是单点。** 13 个 `-free` 里只有 `space-bunny-free` 能第三方直连；
-  `fledge-alpha-free`、`nemotron-3-ultra-free`、`nemotron-3.5-lightning-free`、
-  `longcat-2.5-preview-free` 一律 403 `OpenCode's free tier can only be used from
-  within OpenCode`——上游按**调用来源**限制，不按请求头（`space-bunny-free` 不带任何
-  指纹头也能成功）。桥会把这 4 个移出候选池，并在遇到它们时自动换档。
-  **它被打满时，桥会如实回 429 并建议加车道**——这才是单点的真实样子。
-  要消掉这个单点，见上面的「多车道」。
+- **⚠️ 开箱即用是单点，而且市场上只有这一条免密车道。** 13 个 `-free` 里只有
+  `space-bunny-free` 能第三方直连；`fledge-alpha-free`、`nemotron-3-ultra-free`、
+  `nemotron-3.5-lightning-free`、`longcat-2.5-preview-free` 一律 403
+  `OpenCode's free tier can only be used from within OpenCode`——上游按**调用来源**限制，
+  不按请求头（`space-bunny-free` 不带任何指纹头也能成功）。桥会把这 4 个移出候选池，
+  并在遇到它们时自动换档。
+- **⚠️ 别再找别的免密白嫖了，真没有了。** 实测 11 家（`node scripts/probe-keyless.mjs`）：
+  只有 OpenCode 这一家不带 key 也能调；智谱、OpenRouter、SiliconFlow、Kimi、Cerebras、
+  Groq、NVIDIA、Cloudflare **全部要 key**。顺带确认 `/zen/go/v1` 这条路径也回
+  `401 Missing API key`——它是计费路径，不是第二条免密车道。
+  **所以「第二条车道」的现实形态是自己注册一个免费 key**，见上面「多车道」。
 - **故障转移是有序且有界的。** 先同车道换模型，再换车道；每个 `lane:model` 最多一次，
   总跳数上限 `MAX_FAILOVER_HOPS`（默认 16）。实测主车道 7 个候选全挂时，
   桥一次请求打 7 次上游然后交给备用车道——不会打转，但也确实试了 7 次。
@@ -275,6 +284,8 @@ environment:
   但运行中新增的可用模型要重启才被发现。
 - **上游哪天改成计费怎么办？** 桥在响应里看到非零 `cost` 字段时会打 WARNING 日志。
   这是被动发现，不是主动保证——**请自己看一眼账单**。
+- **桥也会拒绝「假成功」。** 上游回 200 但正文为空时，桥降级成一次明确失败而不是照传。
+  否则调用方会以为成功——实测这正是 `json_schema` 不带 `strict` 时的真实行为。
 - **桥不做重试。** 它把故障转移交给调用方决定（因为只有调用方知道该不该重试）。
   Hindsight 侧建议 `HINDSIGHT_API_LLM_MAX_RETRIES=2`。
 - **局域网暴露 = 把额度送人。** 桥默认只绑回环。改成 `0.0.0.0` 之前请确认你的网络可信。

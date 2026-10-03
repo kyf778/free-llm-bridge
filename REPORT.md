@@ -148,8 +148,48 @@ x-opencode-project: global
 但**不满足「换到另一个不同的模型」**。
 
 所以故障转移代码本身是对的（遇到 429 会换），但**可用候选池实际上只有一项**。
-真要靠故障转移顶住限流，得先把候选池扩到 2 个以上——而这需要上游放开那些
-`opencode-only` 的模型，或者换一条完全不同的免费车道（见第九节）。
+真要靠故障转移顶住限流，得先把候选池扩到 2 个以上——见下面这节。
+
+### 那第二条车道去哪找？——「免密」这件事，实测只有一家
+
+先排除了一个我以为是机会的线索：Hindsight 配置文档里出现过
+`HINDSIGHT_API_LLM_PROVIDER=opencode-go`、base_url `https://opencode.ai/zen/go/v1`。
+实测（`scripts/discover-second-lane.mjs`）：
+
+```
+/zen/v1/chat/completions       200  OK
+/zen/go/v1/chat/completions    401  AuthError: Missing API key
+/zen/go/chat/completions       404
+/go/v1/chat/completions        404
+```
+
+`/zen/go` 是**计费路径**，不是第二条免密车道。
+
+于是又逐家测了「不带 key 能不能调」（`scripts/probe-keyless.mjs`）：
+
+| 通道 | 未鉴权结果 |
+| --- | --- |
+| **OpenCode Zen** | ✅ **200，真正免密** |
+| 智谱 GLM-4-Flash | 401 `Header中未收到Authorization参数` |
+| OpenRouter | 401 `No cookie auth credentials found` |
+| SiliconFlow | 401 `Token is invalid` |
+| Moonshot / Kimi | 401 `Incorrect API key provided` |
+| Cerebras | 403 |
+| Groq | 403 |
+| NVIDIA NIM | 410 |
+| Cloudflare Workers AI | 404 |
+
+**结论：市场上只有 OpenCode 这一家是真免密。** 其余都是「注册拿 key、用免费额度」——
+而这**已经够了**：对 Hindsight 这种每轮对话自动跑 4 个环节的负载，注册一次、
+额度用完再等，账单永远是 0。
+
+所以第二条车道的现实形态是**自己去注册一个免费 key**，不是继续找免密白嫖。
+这也让「多车道」从锦上添花变成了**必做项**（见第四节的 `LANES`）。
+
+> 这轮还暴露了探测器自身的一个 bug：第一版拿别家模型名去问 OpenCode，它回
+> 401 + `ModelError: xxx is not supported`——那不是鉴权失败。探测器把它判成
+> 「需要 key」，差点让结论整条反掉。修正判据（区分「模型不对」与「缺 key」）之后
+> 才是上面这张表。**探测器的判据本身也是需要验证的东西。**
 
 ---
 
@@ -455,9 +495,16 @@ HINDSIGHT_API_LLM_API_KEY: <你的智谱 key>
 - **⚠️ 只有一个模型真能用。** 13 个 `-free` 里只有 `space-bunny-free` 能第三方直连
   （详见第二节的实测表）。其余是 429 限流、403 opencode-only、403 地区门或 500。
   **这条路线没有真正的冗余**——单点。
+- **⚠️ 而且市场上只有这一条免密车道。** 实测 11 家，只有 OpenCode 不带 key 也能调；
+  其余全部要 key（详见第二节末的对照表）。所以消除单点的办法不是继续找白嫖，
+  而是**自己注册一个免费 key** 加第二条车道。
 - **⚠️ 结构化输出不是硬保证。** `response_format` 在这条车道上是提示而非语法约束：
   模型三次运行给正文起了三个不同的字段名（`text` / `fact_text` / `content`），
   并稳定省略 schema 的必填项。Hindsight 能容忍，但**你的消费方未必**。
+- **「假装成功」是最危险的失败模式。** 实测上游在 `json_schema` 不带 `strict` 时
+  会回 **200 但正文为空**。放过它，Hindsight 的 retain 会「成功」地抽出零条事实——
+  记忆看起来在工作，实际什么都没存，且没有任何地方报错。桥现在把空完成降级成
+  一次明确失败，让它走故障转移或如实上报。
 - **「免费」不等于「无限」。** 这条车道按 session 限速，打满会 429。桥会退避和换档，
   但候选池实际只有一项，换来换去还是同一个模型。
 - **免费档会变。** 上游随时可能改模型集合或政策。桥启动时探测一次，运行中新增的可用模型

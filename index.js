@@ -806,11 +806,51 @@ async function complete(lane, model, body, ids) {
     if (cost !== undefined && cost !== null && String(cost) !== '0') {
       log(`WARNING: upstream reported cost=${cost} on a free-lane model — the lane may no longer be free`)
     }
+    // 200 但正文是空的——这不是一次成功，是一次静默失败。
+    //
+    // 放过它比报错危险得多：调用方（Hindsight 的 retain）会「成功」地抽取出零条事实，
+    // 记忆看起来在工作，实际什么都没存，而且没有任何地方会报错。实测这条车道在
+    // `json_schema` 不带 strict 时就会这么干（见 normalizeResponseFormat 的注释）。
+    //
+    // 所以这里把它降级成一次失败，好让它走故障转移或如实报给调用方。
+    if (isEmptyCompletion(parsed)) {
+      return {
+        ok: false,
+        status: 502,
+        type: 'server_error',
+        message: `lane ${lane.name}/${model} returned an empty completion (a silent failure, not a real answer)`,
+        emptyCompletion: true,
+      }
+    }
     return { ok: true, payload: parsed, lane: lane.name, model }
   }
 
   const failure = upstreamFailure(response.status, await safeErrorBody(response), lane, model)
   return worthFailoverTo(failure, model, ids) ? failover(lane, model, body, ids, failure) : failure
+}
+
+/**
+ * 一次 200 响应算不算「空完成」。
+ *
+ * 判据是**没有任何可读内容**：既没有正文，也没有工具调用。usage 之类不算内容。
+ * 流式响应不在这里判——那要等帧流完，由 pipeStream 的下游自己看。
+ *
+ * @param {object} payload 已解析的 OpenAI 兼容响应
+ * @returns {boolean}
+ */
+function isEmptyCompletion(payload) {
+  const choices = Array.isArray(payload?.choices) ? payload.choices : []
+  if (choices.length === 0) return true
+  for (const choice of choices) {
+    const message = choice?.message ?? {}
+    const content = message.content
+    const hasText = typeof content === 'string'
+      ? content.trim() !== ''
+      : Array.isArray(content) && content.length > 0
+    const hasToolCalls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0
+    if (hasText || hasToolCalls) return false
+  }
+  return true
 }
 
 /**
@@ -848,6 +888,8 @@ function worthFailoverTo(failure, model, ids) {
   return failure.status === 429 ||
     failure.authFailure === true ||
     failure.transportFailure === true ||
+    // 空完成也值得换：另一个车道/模型多半能正常答，换一个比回空强。
+    failure.emptyCompletion === true ||
     (failure.status === 403 && KNOWN_OPENCODE_ONLY.has(model))
 }
 
@@ -1066,11 +1108,19 @@ async function handle(req, res) {
     await pipeStream(outcome.response, res, target)
   } else {
     const retryAfter = cooldownRemainingSec(lane, target)
+    // 上游的失败信息说的是「哪条车道被限流了」，而调用方需要知道的是「你该怎么办」。
+    // 全车道不可用时补一句可执行的建议，否则用户只能看着一句 lane/model 干瞪眼。
+    const hint = outcome.status === 429 && LANES.length < 2
+      ? ' — every free lane is currently rate limited; add a second lane via the LANES env var (see README)'
+      : outcome.status === 429 && LANES.length > 1
+        ? ' — every configured lane is currently rate limited'
+        : ''
+    const message = `${outcome.message}${hint}`
     if (retryAfter > 0) {
       res.writeHead(outcome.status, { 'retry-after': String(retryAfter), 'content-type': 'application/json' })
-      res.end(JSON.stringify({ error: { message: outcome.message, type: outcome.type, param: null, code: null } }))
+      res.end(JSON.stringify({ error: { message, type: outcome.type, param: null, code: null } }))
     } else {
-      openAiError(res, outcome.status, outcome.type, outcome.message)
+      openAiError(res, outcome.status, outcome.type, message)
     }
   }
 }
