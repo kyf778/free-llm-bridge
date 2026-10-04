@@ -364,8 +364,8 @@ environment:
   HINDSIGHT_API_LLM_API_KEY: local
   HINDSIGHT_API_LLM_MODEL: space-bunny-free
 
-  # ── 建议：关思考 + 放宽超时 + 压并发 + 少重试 ───────────────
-  HINDSIGHT_API_LLM_EXTRA_BODY: '{"thinking":{"type":"disabled"},"max_tokens":4096}'
+  # ── ⚠️ 不要放 thinking（米莫方言，实测上游 400）──────────
+  HINDSIGHT_API_LLM_EXTRA_BODY: '{"max_tokens":4096}'
   HINDSIGHT_API_LLM_TIMEOUT: 600
   HINDSIGHT_API_LLM_CONNECT_TIMEOUT: 15
   HINDSIGHT_API_LLM_MAX_RETRIES: 2
@@ -381,8 +381,13 @@ environment:
 
 - **必须放宽超时。** 免费车道思考期可能静默 60–70 秒，Hindsight 默认 120 秒总超时
   在整合那种 17–19k token 的调用上会不够。
-- **建议关思考。** 思考 token 与正文抢同一份额度，对「只要结论」的记忆提取纯浪费。
-  你原来就用 `HINDSIGHT_API_LLM_EXTRA_BODY` 关掉了，这里保留同样的字段名即可。
+- **⚠️ `EXTRA_BODY` 里别塞米莫的方言参数 `thinking`——实测它就是 400 的根因。**
+  初版配置照抄了你原来给米莫关思考的
+  `EXTRA_BODY={"thinking":{"type":"disabled"},"max_tokens":4096}`，
+  结果 Hindsight 启动验证被上游拒（`invalid request`，确定性复现两次）。
+  逐字段对照实测：带 `thinking` → 上游 400；去掉它只留 `max_tokens` → 200。
+  `HINDSIGHT_API_LLM_EXTRA_BODY` 会合并进**每一次** LLM 调用，所以它一错，全链路错。
+  最终值：`{"max_tokens":4096}`。（`max_completion_tokens` 被同时证伪：三组对照全 200。）
 - **⚠️ `BASE_URL` 里的地址取决于桥和 Hindsight 是不是同一台机器。**
   你的情况是**不同机器**（桥在电脑 `192.168.1.10`，Hindsight 在 NAS `192.168.1.20`），
   所以桥必须绑 `HOST=0.0.0.0`，`BASE_URL` 填**桥那台机器的局域网 IP**。
@@ -559,22 +564,31 @@ HINDSIGHT_API_LLM_API_KEY: <你的智谱 key>
 
 ```
 free-llm-bridge/
-├── index.js                  # 桥本体，单文件零依赖
-├── test-free-only.mjs        # 26 条离线回归断言，不出网，CI 可跑
-├── smoke.mjs                 # 13 条端到端断言
-├── soak.mjs                  # 持续性 + 故障转移验证
-├── docker-compose.yml        # Docker 部署
+├── index.js                  # 桥本体，单文件零依赖（多车道 / 故障转移 / schema 规整）
+├── 启动桥.cmd                # 双击启动器：HOST=0.0.0.0 + 打印局域网 IP（纯 ASCII+CRLF）
+├── package.json              # npm test = 三套离线断言
+├── test-free-only.mjs        # 零成本保证 + 会话亲和 + 指纹门 + schema + 文档一致性（离线）
+├── test-multilane.mjs        # 多车道故障转移，本地假上游（离线）
+├── test-degradation.mjs      # 全车道失败时的降级行为，盯「假成功」（离线）
+├── smoke.mjs                 # 端到端（真打上游）
+├── soak.mjs                  # 持续性 + 故障转移（真打上游）
+├── docker-compose.yml        # 桥的 Docker 部署
 ├── deploy/
 │   └── free-llm-bridge.service   # systemd 部署
 ├── scripts/
+│   ├── verify-deployment.ps1     # 一键验收：桥/补全/Hindsight 调用记录（UTF-8 with BOM）
 │   ├── cost-analysis.mjs         # 从 Hindsight 账单接口量真实开销
 │   ├── probe-free-models.mjs     # 逐个探测 -free 模型真实可用性
+│   ├── probe-keyless.mjs         # 11 家「不带 key 能不能调」实测
+│   ├── probe-throttled-depth.mjs # 429 是速率限制还是额度池已关
+│   ├── probe-retry-after.mjs     # retry-after 是不是真倒计时
+│   ├── discover-second-lane.mjs  # 找第二条免密路径（结论：没有）
 │   ├── hindsight-extract-check.mjs  # 用 Hindsight 真 schema 做端到端抽取
 │   ├── diag-json-schema.mjs      # response_format 各形状对比
 │   ├── diag-schema-shape.mjs     # 定位被拒的 schema 关键字
 │   └── diag-grammar.mjs          # 分离 schema 复杂度与模型两个变量
 ├── docs/
-│   ├── hindsight-setup.md    # Hindsight 完整接入步骤
+│   ├── hindsight-setup.md    # Hindsight 完整接入步骤 + 排错 FAQ
 │   └── publish-to-github.md  # 首次发开源的照做清单
 ├── README.md
 └── REPORT.md                 # 本报告
@@ -583,12 +597,55 @@ free-llm-bridge/
 每个诊断脚本都对应一个**实测踩出来的坑**，不是写来好看的：
 `diag-schema-shape.mjs` 是为了找出 400 的真因（联合类型），
 `diag-grammar.mjs` 是为了区分「schema 太复杂」和「模型不配合」，
-`probe-free-models.mjs` 是为了推翻「11 个模型可用」这个错误结论。
+`probe-free-models.mjs` 是为了推翻「11 个模型可用」这个错误结论，
+`probe-keyless.mjs` 是为了证明「市场上只有这一家免密」，
+`probe-retry-after.mjs` 是为了把「429 = 不可用」更正成「90 分钟后恢复」。
 
 ---
 
-## 十二、下一步（需要你做）
+## 十二、部署状态（2026-10-05 实况）
 
-1. **NAS 上改 Hindsight 的 compose 环境变量** —— 见第六节
-2. **确认零成本**：跑几次对话，看桥日志里有没有 `routing X -> Y`，有没有 WARNING cost 行
-3. **发布到 GitHub** —— 见下一节
+| 步骤 | 状态 |
+| --- | --- |
+| 桥跑在电脑（0.0.0.0:18999，双击启动器） | ✅ 用户操作，验收通过 |
+| 防火墙放行 18999（仅局域网段） | ✅ 用户操作，NAS→桥实测 200 |
+| NAS compose 指向桥 + 超时/并发变量 | ✅ SSH 完成，旧配置已备份（NAS `.bak-free-bridge` + 本地副本） |
+| Hindsight 重建并 healthy | ✅ LLM verification 多次通过（`Connection verified: openai/space-bunny-free`） |
+| 实战排掉的两个坑 | `thinking` 字段致 400（EXTRA_BODY 已改）；300s 看门狗不匹配慢机器（已加 900s） |
+| 遗留风险（已进 FAQ） | pg0 启动竞态可能复发，`docker restart` 通常自愈 |
+
+剩余：智谱第二车道（可选）、GitHub 发布（需用户账号授权）。
+
+---
+
+## 十三、验收结果与剩余事项
+
+### ✅ 最终验收（2026-10-05，三段全绿，exit 0）
+
+```
+=== 1. 桥从局域网入口可达 ===        PASS  lanes: zen
+=== 2. 走桥发一次真实补全 ===        PASS  VERIFY_OK，落在 space-bunny-free
+=== 3. Hindsight 最近调用全免费 ===  PASS  最近 10 条全部 *-free
+ALL CHECKS PASSED — 零成本链路已打通
+```
+
+**关键证据**：迁移完成（UTC 09:33）之后的真实 retain / consolidation 记录
+（09:46–09:53，共 15+ 条）model **全部是 `space-bunny-free`**，没有任何新的 mimo 调用；
+连一次 dry-run（in=3356/out=131）也走的桥，usage 与响应完全对得上。
+09:33 前的历史 mimo 记录属迁移前存量，未触碰。
+
+按本报告第一节的实测账单外推：这条链路之前每天烧 ¥10.87，现在 **¥0**。
+
+### 非阻塞观察（已进排错 FAQ）
+
+- 一次偶发 `OutputTooLongError`（consolidation 偶尔超免费档输出上限），
+  **下一次尝试即成功**——持续出现才需要调，单次不用管。
+- dry-run 的 LLM 调用在 llm-requests 里被记成 `operation=retain`，
+  与真实 retain 标签不可区分（上游记账瑕疵，靠 token 数可辨认），非 bug。
+
+### 剩余事项
+
+1. **（可选）智谱第二车道**：注册免费 key 加 `LANES`，把「限流 90 分钟才恢复」
+   换成即时备份。
+2. **发布到 GitHub**：见 `docs/publish-to-github.md`，需要你的账号授权。
+3. （低优先）pg0 启动竞态的复发风险已在排错 FAQ 留了关键词与处置命令。

@@ -237,10 +237,11 @@ environment:
 宿主机，而不是你跑桥的电脑。这一步实测过两种绑定方式的差别，见
 [docs/hindsight-setup.md](docs/hindsight-setup.md#让-nas-容器能访问--先看清你的拓扑)。
 
-另外记得关掉思考并放宽超时——思考 token 与正文抢同一份额度，而记忆提取只要结论：
+另外记得放宽超时。`EXTRA_BODY` 用 `max_tokens` 兜输出上限——**别放 `thinking`**，
+那是米莫的方言参数，实测免费车道对它回 400（而且 EXTRA_BODY 会合并进每一次 LLM 调用）：
 
 ```yaml
-  HINDSIGHT_API_LLM_EXTRA_BODY: '{"thinking":{"type":"disabled"},"max_tokens":4096}'
+  HINDSIGHT_API_LLM_EXTRA_BODY: '{"max_tokens":4096}'
   HINDSIGHT_API_LLM_TIMEOUT: 600
 ```
 

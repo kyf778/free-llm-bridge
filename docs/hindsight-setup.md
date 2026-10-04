@@ -163,8 +163,8 @@ environment:
   HINDSIGHT_API_LLM_API_KEY: local
   HINDSIGHT_API_LLM_MODEL: space-bunny-free
 
-  # ── 思考关掉：思考与正文抢同一份额度，且是纯浪费 ─────────────
-  HINDSIGHT_API_LLM_EXTRA_BODY: '{"thinking":{"type":"disabled"},"max_tokens":4096}'
+  # ── 思考关不掉就用上限兜：thinking 是米莫方言，实测免费车道回 400 ──
+  HINDSIGHT_API_LLM_EXTRA_BODY: '{"max_tokens":4096}'
 
   # ── 超时必须放宽：免费车道思考期可能静默 60-70 秒 ─────────────
   HINDSIGHT_API_LLM_TIMEOUT: 600
@@ -289,8 +289,51 @@ curl -s http://127.0.0.1:18999/health | jq '{throttled, retryInSec, lanes: [.lan
 通常比默认档好；实在不满意再考虑 README 里的本地模型路线。
 
 **Q: 能不能不开思考？**
-能，而且应该开。见上面 `HINDSIGHT_API_LLM_EXTRA_BODY` 里的 `thinking` 字段。
-思考 token 与正文抢同一份输出预算，对记忆提取这种「只要结论」的任务纯浪费。
+能，而且应该开——思考 token 与正文抢同一份输出预算，对「只要结论」的记忆提取
+纯浪费。注意 `thinking` 这类参数是**按上游给的**：米莫认它，免费车道未必认；
+不确定就用桥能透传的通用手段（如 `max_tokens` 上限），别把一家的方言塞进
+全局 EXTRA_BODY 里。
+
+**Q: 容器重建后起不来，日志报 `❌ API did not become healthy within 300s`。**
+这台机器初始化慢（sentence-transformers 加载 + 内嵌 Postgres 启动可能超过 5 分钟），
+而 Hindsight 默认 300 秒看门狗会先放弃，容器被杀后进入重启循环。
+日志自己给了改法（已实测确认），在 compose 的 environment 里加两行：
+
+```yaml
+      - HINDSIGHT_API_STARTUP_WAIT_SECONDS=900
+      - HINDSIGHT_API_MODEL_INIT_TIMEOUT=900
+```
+
+改完 `docker compose up -d` 重建，等初始化完成（慢机器上 5-8 分钟是正常的）。
+判断就绪：`curl http://127.0.0.1:8888/health` 返回 JSON。
+
+**Q: 重建后容器反复重启，日志报 `ValueError: Database URL is required for migrations`。**
+这是 Hindsight 镜像内嵌 Postgres（pg0）的**启动竞态**，与本桥的配置无关——
+pg0 的 `info()` 在 start 后偶尔返回 `uri=None`，常伴随机身上的陈旧
+`postmaster.pid`。实测表现：前 3 次启动失败，第 4 次自愈（`RestartCount=3` 后稳定），
+日志关键词 `Database URL is required for migrations` / `PostgreSQL started: None`。
+
+处置（按顺序试，多数情况第一步就够）：
+1. `docker restart hindsight` —— 实测它自己就能在几次内自愈；
+2. 若持续不愈，进容器删掉陈旧 pid 后再 restart：
+   `docker exec hindsight sh -c "rm -f /home/hindsight/.pg0/instances/hindsight/data/postmaster.pid"`；
+3. 还不行才是镜像问题（`ghcr.io/vectorize-io/hindsight:latest` 当日构建），
+   固定到某个历史 tag 或给 compose 加 healthcheck。
+
+这是**存量数据卷上的运维风险**，不是零成本改造引入的——但既然遇到了就记在这，
+复发时不用从头排查。
+
+**Q: 日志偶发 `OutputTooLongError: LLM output exceeded token limits (scope=consolidation)`。**
+非阻塞。免费档的输出上限比 mimo 小，整合环节偶尔一次超限，Hindsight 自己会提示
+「Input may need to be split into smaller chunks」，**下一次尝试通常直接成功**
+（实测同一分钟内 error 后紧跟 success）。持续出现才需要处理：
+把 consolidation 单独配一个更大的 `HINDSIGHT_API_CONSOLIDATION_LLM_EXTRA_BODY`，
+或降低触发频率。单次偶发不用管。
+
+**Q: 日志里 LLM 连接验证 400，但不确定 retain 会不会也 400。**
+见上一节「假成功」和「400」两条——验证只是启动自检，被 Hindsight 明确降级为
+WARNING（「Server will start but LLM-dependent operations may fail」），不阻塞启动。
+真正的判据是第一次真实 retain 能不能过，跑完一次 `verify-deployment.ps1` 看第 3 步。
 
 **Q: 会不会哪天这条车道就没了？**
 会。它是公开免费额度，上游随时可能改政策。所以：
