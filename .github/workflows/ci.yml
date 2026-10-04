@@ -1,0 +1,38 @@
+# 离线断言套件：三套测试全部用本地 mock 上游，不打真实网络、不花钱。
+# 所以 CI 可以对每个 PR 无条件跑，不需要任何 secret。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    # 项目零依赖，`npm ci` 无 lockfile 意义，直接用预装 Node 即可
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # package.json 的 engines 声明是 ^22.19.0 || >=24.0.0
+        # 同时钉住 22.x 下沿与 24.x，避免哪天用到新语法只在 CI 上炸
+        node: ['22.19.0', '24.x']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      # 零依赖项目：明确不跑 npm ci/install，避免失败原因与被测代码无关
+      - name: Syntax check
+        run: node --check index.js
+
+      - name: Offline assertion suites
+        run: npm test
+
+      - name: Explain the failure if it happens
+        if: failure()
+        run: |
+          echo "::error::npm test 失败。三套断言都用本地 mock 上游，"
+          echo "::error::所以这一定是代码回归，与网络/额度/上游策略无关。"

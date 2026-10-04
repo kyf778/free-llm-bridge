@@ -1,5 +1,8 @@
 # free-llm-bridge
 
+[![CI](https://github.com/kyf778/free-llm-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/kyf778/free-llm-bridge/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
+
 **把任意 OpenAI 兼容应用接到一条免密、零成本、无限量的 LLM 车道上。**
 
 为 [Hindsight](https://github.com/vectorize-io/hindsight) 这类记忆系统而写——它每轮对话后
@@ -184,7 +187,9 @@ node smoke.mjs            # 端到端。真打上游，会消耗免费额度
 node soak.mjs             # 持续性 + 故障转移。真打上游
 ```
 
-前三条都不出网，`npm test` 会依次跑完，可以在 CI 里跑。
+前三条都不出网（全部用本地 mock 上游），`npm test` 会依次跑完。
+CI 对每个 push 和 PR 都在 **Node 22.19 / 24.x 两个版本**上跑这套断言——
+它们不需要任何 secret，因为根本不打真实网络。上方徽章是实跑的，不是摆设。
 
 `test-multilane.mjs` 值得单独说一句：**多车道逻辑没法只靠真实上游验证**，
 因为真实免密车道只有一个模型能用，主车道限流之后根本没有第二条真实车道可换。

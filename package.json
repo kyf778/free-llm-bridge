@@ -1,6 +1,6 @@
 {
   "name": "free-llm-bridge",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "description": "把免密免费 LLM 车道接给任意 OpenAI 兼容应用（多车道、零成本、故障转移）",
   "type": "module",
   "main": "index.js",
