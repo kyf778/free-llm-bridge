@@ -14,8 +14,8 @@
 #>
 
 param(
-  [string]$BridgeIP = "192.168.31.21",
-  [string]$HindsightURL = "http://192.168.31.123:8888",
+  [string]$BridgeIP = "192.168.1.10",
+  [string]$HindsightURL = "http://192.168.1.20:8888",
   [string]$Bank = "coding-agent::default-workspace",
   [int]$Limit = 10,
   # 桥已容器化进 NAS compose（无端口发布）后，PC 侧探不到它——
