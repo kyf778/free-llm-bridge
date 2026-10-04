@@ -862,7 +862,7 @@ async function complete(lane, model, body, ids) {
     // 上游哪天把这个车道改成计费的，这里会第一个看见——如实记下来，而不是静默收下。
     const cost = parsed?.cost
     if (cost !== undefined && cost !== null && String(cost) !== '0') {
-      log(`WARNING: upstream reported cost=${cost} on a free-lane model — the lane may no longer be free`)
+      log(`WARNING: upstream reported cost=${cost} on a free-lane model - the lane may no longer be free`)
     }
     // 200 但正文是空的——这不是一次成功，是一次静默失败。
     //
@@ -1274,11 +1274,11 @@ async function main() {
   const port = await listen()
   log(`listening on http://${HOST}:${port}/v1`)
   for (const lane of LANES) {
-    const key = lane.apiKey === undefined || lane.apiKey === '' ? '免密，无需 API key' : '带 key'
+    const key = lane.apiKey === undefined || lane.apiKey === '' ? 'no API key needed' : 'with key'
     log(`lane "${lane.name}": ${lane.model} @ ${lane.baseUrl} (${key})`)
   }
   if (LANES.length === 1) {
-    log('only one lane configured — a rate limit here stops the bridge; see README on adding more via LANES')
+    log('only one lane configured - a rate limit here stops the bridge; see README on adding more via LANES')
   }
   void refreshModels()
 }

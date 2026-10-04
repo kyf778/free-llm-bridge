@@ -2,6 +2,11 @@
 # 这会让 diff 出现整文件变更，也会让按字节计算的校验出问题。
 * text=auto eol=lf
 
+# 批处理必须 CRLF：LF-only 的 .cmd 在某些 cmd 解析路径下（goto/call 标签）会出错。
+# 另外 .cmd 内容必须是纯 ASCII（不要 chcp、不要中文），否则 cmd 按 GBK 解析
+# 加上代码页切换会造成行错位——详见 启动桥.cmd 的事故记录。
+*.cmd text eol=crlf
+
 *.js   text eol=lf
 *.mjs  text eol=lf
 *.yml  text eol=lf
