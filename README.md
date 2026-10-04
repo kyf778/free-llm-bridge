@@ -215,27 +215,23 @@ node scripts/cost-analysis.mjs [hindsightUrl] [bankId]
 
 ## 给 Hindsight 用
 
-见 **[docs/hindsight-setup.md](docs/hindsight-setup.md)**。最小改动是这四行：
+见 **[docs/hindsight-setup.md](docs/hindsight-setup.md)**。推荐形态是**把桥容器化进
+Hindsight 的同一个 compose**（无窗口、开机自启、端口不发布、电脑可关机），最小改动：
 
 ```yaml
 environment:
   HINDSIGHT_API_LLM_PROVIDER: openai
-  # ⚠️ 填**跑桥那台机器的局域网 IP**
-  HINDSIGHT_API_LLM_BASE_URL: http://192.168.1.10:18999/v1
+  # 同一 compose 里的桥用服务名直连；桥跑在别的机器上时换成那台机器的局域网 IP
+  HINDSIGHT_API_LLM_BASE_URL: http://free-llm-bridge:18999/v1
   HINDSIGHT_API_LLM_API_KEY: local
   HINDSIGHT_API_LLM_MODEL: space-bunny-free
+  # ⚠️ 必须显式写——缺了它会踩内嵌 pg0 的启动死循环（详见 setup 文档排错 FAQ 第一条）
+  HINDSIGHT_API_DATABASE_URL: pg0://hindsight
 ```
 
-⚠️ **`BASE_URL` 里的地址取决于桥和 Hindsight 是不是同一台机器**：
-
-- **不同机器**（常见，比如桥在电脑、Hindsight 在 NAS）→ 桥要 `HOST=0.0.0.0`，
-  `BASE_URL` 填**桥那台机器的局域网 IP**。
-- **同一台机器** → 桥保持默认回环，加 `extra_hosts: ["host.docker.internal:host-gateway"]`，
-  `BASE_URL` 用 `http://host.docker.internal:18999/v1`。
-
-**`host.docker.internal` 在「不同机器」时是错的**——它指向 Hindsight 所在那台机器的
-宿主机，而不是你跑桥的电脑。这一步实测过两种绑定方式的差别，见
-[docs/hindsight-setup.md](docs/hindsight-setup.md#让-nas-容器能访问--先看清你的拓扑)。
+桥也可以跑在自己电脑上（双击 `启动桥.cmd`），但那是备选：要开窗口、要配防火墙、
+电脑关机记忆就停。跨机器时 `host.docker.internal` 是**错的**——它指向 Hindsight
+所在那台机器的宿主机。实测细节见 setup 文档。
 
 另外记得放宽超时。`EXTRA_BODY` 用 `max_tokens` 兜输出上限——**别放 `thinking`**，
 那是米莫的方言参数，实测免费车道对它回 400（而且 EXTRA_BODY 会合并进每一次 LLM 调用）：

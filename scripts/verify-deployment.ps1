@@ -17,7 +17,10 @@ param(
   [string]$BridgeIP = "192.168.31.21",
   [string]$HindsightURL = "http://192.168.31.123:8888",
   [string]$Bank = "coding-agent::default-workspace",
-  [int]$Limit = 10
+  [int]$Limit = 10,
+  # 桥已容器化进 NAS compose（无端口发布）后，PC 侧探不到它——
+  # 用 -SkipBridgeProbe 跳过前两节，只验第 3 节（Hindsight 调用记录才是最终事实）
+  [switch]$SkipBridgeProbe
 )
 
 $ErrorActionPreference = "Stop"
@@ -34,6 +37,13 @@ function Check($name, $ok, $detail) {
   if ($detail) { $line = $line + "  --  " + $detail }
   Write-Output $line
 }
+
+if ($SkipBridgeProbe) {
+  Write-Output ""
+  Write-Output "=== 1/2 桥探测已跳过 -SkipBridgeProbe ==="
+  Write-Output "  （桥已容器化在 NAS compose 内部网络，不发布端口，PC 侧本来就探不到；"
+  Write-Output "    桥的健康由 Hindsight 启动时的 Connection verified 与第 3 节调用记录证明）"
+} else {
 
 Write-Output ""
 Write-Output "=== 1. 桥从局域网入口可达 ==="
@@ -64,6 +74,8 @@ try {
 } catch {
   Check "补全返回 200" $false $_.Exception.Message
 }
+
+}  # end if (-not $SkipBridgeProbe)
 
 Write-Output ""
 Write-Output "=== 3. Hindsight 最近的调用是不是全免费 ==="

@@ -411,10 +411,11 @@ asyncTest('index.js 的两处调用都把响应头传给了 upstreamFailure', as
   assert.equal(calls.length, 2, `expected 2 call sites to pass the header, found ${calls.length}`)
 })
 
-asyncTest('部署文档里的 BASE_URL 与实际拓扑一致（不是 host.docker.internal）', async () => {
-  // 这条为一个真实错误而写：文档曾把 `host.docker.internal` 当成通用做法，
-  // 但它只在「桥与 Hindsight 同一台机器」时有效。本项目的部署目标里两者在不同
-  // 机器上（桥在电脑、Hindsight 在 NAS），照抄会连不上，而且失败方式隐蔽。
+asyncTest('部署文档的 BASE_URL 与实际拓扑一致（桥容器化 = compose 服务名）', async () => {
+  // 这条为两次真实错误而写：
+  //  1) 文档曾把 host.docker.internal 当通用做法——跨机器时它指向错误的宿主机；
+  //  2) 方案 A 把桥搬进同一个 compose 后，正确值变成服务名 free-llm-bridge。
+  // 断言跟着部署形态走，形态变了而文档没改，这条会红。
   const setup = await readFile(new URL('./docs/hindsight-setup.md', import.meta.url), 'utf8')
   const envBlock = setup.match(/### 改之后（零成本）[\s\S]*?```yaml\n([\s\S]*?)```/)
   assert.ok(envBlock !== null, 'setup doc should have a "改之后" yaml block')
@@ -424,8 +425,19 @@ asyncTest('部署文档里的 BASE_URL 与实际拓扑一致（不是 host.docke
     !baseUrl[1].includes('host.docker.internal'),
     `the deploy block must not use host.docker.internal for a cross-host setup, got ${baseUrl[1]}`,
   )
-  assert.match(baseUrl[1], /^http:\/\/\d+\.\d+\.\d+\.\d+:\d+\/v1$/,
-    `BASE_URL should be a LAN IP + /v1, got ${baseUrl[1]}`)
+  assert.match(baseUrl[1], /^http:\/\/free-llm-bridge:18999\/v1$/,
+    `containerized deploy expects the compose service name, got ${baseUrl[1]}`)
+})
+
+asyncTest('部署文档包含 pg0 显式 URL（缺了它容器会陷入启动死循环）', async () => {
+  // 实测教训：不写 HINDSIGHT_API_DATABASE_URL 时，pg0 start() 返回值 bug 导致
+  // `PostgreSQL started: None → ValueError → 重启循环`（7 轮日志证据）。
+  // 这行配置是根治手段，文档样例里丢了它 = 新用户必然踩坑。
+  const setup = await readFile(new URL('./docs/hindsight-setup.md', import.meta.url), 'utf8')
+  const envBlock = setup.match(/### 改之后（零成本）[\s\S]*?```yaml\n([\s\S]*?)```/)
+  assert.ok(envBlock !== null, 'setup doc should have a "改之后" yaml block')
+  assert.match(envBlock[1], /HINDSIGHT_API_DATABASE_URL:\s*pg0:\/\/hindsight/,
+    'the deploy block must include the explicit pg0 DATABASE_URL')
 })
 
 asyncTest('部署文档明确区分了「同一台机器」与「不同机器」两种拓扑', async () => {

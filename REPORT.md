@@ -607,12 +607,13 @@ free-llm-bridge/
 
 | 步骤 | 状态 |
 | --- | --- |
-| 桥跑在电脑（0.0.0.0:18999，双击启动器） | ✅ 用户操作，验收通过 |
-| 防火墙放行 18999（仅局域网段） | ✅ 用户操作，NAS→桥实测 200 |
-| NAS compose 指向桥 + 超时/并发变量 | ✅ SSH 完成，旧配置已备份（NAS `.bak-free-bridge` + 本地副本） |
-| Hindsight 重建并 healthy | ✅ LLM verification 多次通过（`Connection verified: openai/space-bunny-free`） |
-| 实战排掉的两个坑 | `thinking` 字段致 400（EXTRA_BODY 已改）；300s 看门狗不匹配慢机器（已加 900s） |
-| 遗留风险（已进 FAQ） | pg0 启动竞态可能复发，`docker restart` 通常自愈 |
+| ~~桥跑在电脑（双击启动器）~~ | 初版形态，验收通过后已由方案 A 取代 |
+| 防火墙放行 18999（仅局域网段） | ✅ 初版用户操作；容器化后不再需要（可留可删） |
+| NAS compose 指向桥 + 超时/并发变量 | ✅ SSH 完成，旧配置多层备份（`.bak-free-bridge` 等共 4 份） |
+| **方案 A：桥容器化进 NAS compose** | ✅ `free-llm-bridge` 独立容器、无端口发布、`restart: unless-stopped`；BASE_URL 改服务名直连；桥稳定 2h+，LLM 验证 7 次全过 `base_url=http://free-llm-bridge:18999/v1` |
+| 实战排掉的坑① `thinking` 字段致 400 | ✅ EXTRA_BODY 改 `{"max_tokens":4096}`（对照实验实锤） |
+| 实战排掉的坑② 300s 看门狗 vs 慢机器 | ✅ 加 `STARTUP_WAIT_SECONDS=900`（日志原文给的改法） |
+| 实战排掉的坑③ **pg0 启动死循环** | ✅ **根治：显式 `HINDSIGHT_API_DATABASE_URL=pg0://hindsight`**。四轮排查（磁盘/OOM 全排除，postgres 日志证明每轮 ready 而 pg0 `start()` 返回 None）定性为包装层返回值 bug；老办法（docker restart / 删 pid）**实测证伪**，已从 FAQ 撤下 |
 
 剩余：智谱第二车道（可选）、GitHub 发布（需用户账号授权）。
 
@@ -648,4 +649,5 @@ ALL CHECKS PASSED — 零成本链路已打通
 1. **（可选）智谱第二车道**：注册免费 key 加 `LANES`，把「限流 90 分钟才恢复」
    换成即时备份。
 2. **发布到 GitHub**：见 `docs/publish-to-github.md`，需要你的账号授权。
-3. （低优先）pg0 启动竞态的复发风险已在排错 FAQ 留了关键词与处置命令。
+
+（原第 3 条「pg0 复发风险」已解决：显式 `pg0://hindsight` 一行根治，处置说明进了排错 FAQ。）

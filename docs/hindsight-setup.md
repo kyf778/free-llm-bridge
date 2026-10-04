@@ -3,59 +3,83 @@
 这份文档对应两件事：把 `free-llm-bridge` 跑起来，以及把 Hindsight 的 4 个 LLM 环节全部指过去。
 跑完之后 Hindsight 每轮对话产生的 LLM 调用费用为 **0**。
 
-## 架构
+## 架构（推荐形态：桥容器化进 NAS compose）
 
 ```text
   飞牛 NAS  192.168.1.20
-  ┌──────────┐
-  │ hindsight│  :8888
-  │  容器    │◄───────────────────────────┐
-  └──────────┘                            │
-                                retain / reflect / consolidation /
-                                mental-model refresh
-                                             │  OpenAI 兼容 HTTP
-                                             │  ⚠️ 必须用跑桥那台机器的局域网 IP
-                                             │     不能用 host.docker.internal
-                          ┌──────────────────▼─────────────────────┐
-  你的电脑  192.168.1.10  │  free-llm-bridge（单文件 Node 服务）    │
-  局域网访问 :18999 ─────►│  会话亲和 · 指纹门 · 多车道故障转移     │
-                          └──────────────────┬─────────────────────┘
-                                             │  Authorization: Bearer public
-                          ┌──────────────────▼─────────────────────┐
-                          │  OpenCode Zen 免密车道（零成本）       │
-                          │  86 个模型，13 个 `-free`              │
-                          │  同一时刻 1 个可直连，其余限流待恢复   │
-                          └────────────────────────────────────────┘
+  ┌────────────────────────── 一个 docker compose ──────────────────────────┐
+  │  hindsight 容器  :8888                                                  │
+  │      │  OpenAI 兼容 HTTP（compose 内部服务名，不发布端口）              │
+  │      ▼                                                                  │
+  │  free-llm-bridge 容器  :18999（restart: unless-stopped → 开机自启）     │
+  │      │  Authorization: Bearer public                                    │
+  └──────┼──────────────────────────────────────────────────────────────────┘
+         ▼
+  OpenCode Zen 免密车道（零成本）
+  86 个模型，13 个 `-free`；同一时刻 1 个可直连，其余限流待恢复
 ```
 
-**关键点：桥和 Hindsight 在不同的机器上。** 所以：
+**这样安排的好处（2026-10-05 实测确认）**：
 
-1. 桥要绑 `HOST=0.0.0.0`，容器用**跑桥那台机器的局域网 IP**访问它；
-2. 不要把桥装进 Hindsight 容器里——桥需要能独立于 Hindsight 存活；
-3. `host.docker.internal` 在这里**无效**（它指向 NAS 自己，不是你的电脑）。
+1. 两个容器在同一 compose 网络里用服务名 `http://free-llm-bridge:18999/v1` 直连——
+   **桥不发布端口，NAS 主机和局域网都摸不到它**，防火墙都不用配；
+2. `restart: unless-stopped` = NAS 开机/崩溃自动拉起，**不需要常驻窗口**；
+3. **你的电脑可以关机**——记忆系统完全自治，不再依赖"电脑开着 + 记得启动"。
 
-> 这一步实测过：桥绑回环时 `192.168.1.10:18999` 不可达；改成 `0.0.0.0` 后
-> 同一个地址返回 `HTTP 200` 且模型正常返回 `LAN_OK`。
+> 桥也可以跑在自己电脑上（`启动桥.cmd`，保留供本机使用），但那是**备选**：
+> 那种形态下必须 `HOST=0.0.0.0`、必须开防火墙、必须留窗口，且电脑一关记忆就停。
+> 旧拓扑的教训仍然成立——**跨机器时 `host.docker.internal` 是错的**（它指向
+> Hindsight 所在那台机器的宿主机）；详见文末「备选：桥跑在电脑上」。
 
-## 第一步：把桥跑起来
+**Hindsight compose 里的关键三行**（完整见下文"改之后"样例）：
+
+```yaml
+      - HINDSIGHT_API_LLM_BASE_URL=http://free-llm-bridge:18999/v1   # 服务名直连
+      - HINDSIGHT_API_DATABASE_URL=pg0://hindsight                    # ⚠️ 必须显式，见排错 FAQ 第一条
+      - HINDSIGHT_API_LLM_TIMEOUT=600
+```
+
+## 第一步：把桥跑起来（容器化形态）
+
+把 `index.js` 传到 NAS 的 compose 目录（作为只读挂载），再在 compose 里
+**新增一个 free-llm-bridge 服务**（无 `ports:` 段是故意的）：
 
 ```bash
-git clone https://github.com/<你的用户名>/free-llm-bridge.git
-cd free-llm-bridge
-node index.js --port 18999
+# 在仓库根目录
+scp -i <你的NAS密钥> index.js adm@<NAS的IP>:/vol2/1000/Hindsight/bridge-index.js
 ```
 
-验证：
+```yaml
+services:
+  hindsight:
+    environment:
+      - HINDSIGHT_API_LLM_BASE_URL=http://free-llm-bridge:18999/v1
+
+  free-llm-bridge:
+    image: node:22-alpine
+    container_name: free-llm-bridge
+    command: ["node", "/app/index.js", "--port", "18999"]
+    environment:
+      - HOST=0.0.0.0          # 容器内绑全网卡，才能被 compose 网络访问
+    volumes:
+      - ./bridge-index.js:/app/index.js:ro
+    restart: unless-stopped
+    # 没有 ports: 段是故意的——服务名只在本 compose 网络内可解析
+```
+
+> NAS 拉不到 Docker Hub 的话（实测遇到过 `registry-1.docker.io` 超时）：
+> `docker pull docker.m.daocloud.io/library/node:22-alpine && docker tag docker.m.daocloud.io/library/node:22-alpine node:22-alpine`
+
+验证（直接看 Hindsight 的反应最实在）：
 
 ```bash
-curl http://127.0.0.1:18999/health
-# {"ok":true,"service":"free-llm-bridge","upstream":"https://opencode.ai","models":86,...}
-
-curl http://127.0.0.1:18999/v1/models | jq -r '.data[].id'
-# 付费档不会出现；实测不可用的 opencode-only 模型也已排除
+docker compose up -d
+docker logs free-llm-bridge | head -5     # listening / lane zen / probed N models
+docker logs hindsight | grep -i "connection verified"   # ← 链路通的标志
+curl -s http://127.0.0.1:8888/health      # healthy JSON
 ```
 
-**上机之前先跑一次真实可用性探测**，别只看清单：
+**上机之前先跑一次真实可用性探测**，别只看清单（在电脑上跑）：
 
 ```bash
 node scripts/probe-free-models.mjs
@@ -69,26 +93,21 @@ node scripts/probe-free-models.mjs
 > `api_key` 随便填一个非空字符串。桥不需要真 key——它用的是上游公开车道的
 > `Bearer public`。填 `local` 就行。
 
-### 让 NAS 容器能访问 —— 先看清你的拓扑
+### 备选：桥跑在电脑上（旧形态，仅当你不想动 NAS 时）
 
-**这一步是整套部署里最容易搞错的地方**，因为「桥和 Hindsight 是不是同一台机器」
-决定了该用哪种办法。先回答这个问题：
+**推荐形态是上面的容器化**。下面的拓扑方案是桥跑在自己电脑上的情况——
+**开窗口、手动启动、电脑关机记忆就停**，这三个毛病就是它固有的；容器化正是为
+消灭它们而做的。如果只是想在电脑本机临时用桥（比如给别的工具），双击
+`启动桥.cmd` 即可，**不必**给 Hindsight 走这条路。
 
-```text
-情况 1：Hindsight 容器与桥在同一台机器
-        → 用 `host.docker.internal`，桥可以继续只绑回环（更安全）
-
-情况 2：Hindsight 在另一台机器（如 NAS），桥在你的电脑上   ← 大多数人的情况
-        → 必须让桥绑到局域网地址，容器用那台机器的 IP 访问
-```
+跨机器时最容易搞错的一点：
 
 ⚠️ **`host.docker.internal` 只在「同一台机器」时有效。** 它解析到的是**宿主机**，
-而情况 2 里的宿主机是 NAS 自己，不是你跑桥的电脑。实测：桥绑回环时，
-NAS 容器用 `host.docker.internal` 会连到 NAS 的 18999（没有东西在听），
-而不是你电脑上的桥——**而且它不会报「连不上」，而是连上 NAS 上别的东西或超时**，
-很难查。
+而 Hindsight 在 NAS 上时宿主机是 NAS 自己、不是你跑桥的电脑。实测：桥绑回环时，
+NAS 容器用 `host.docker.internal` 会连到 NAS 的 18999（那里没有东西在听），
+而不是你电脑上的桥——**而且它不报「连不上」，而是连上 NAS 上别的东西或超时**，很难查。
 
-#### 情况 2：桥在另一台机器（推荐按这个做）
+#### 情况 A：桥在另一台机器（旧形态主路径）
 
 ```bash
 # Windows PowerShell
@@ -125,7 +144,7 @@ HINDSIGHT_API_LLM_BASE_URL: http://192.168.1.10:18999/v1
 > 桥的鉴权是**请求级**的，不是会话级——所以一旦开了局域网，
 > 「本地自用」这个前提就不成立了。
 
-#### 情况 1：同一台机器
+#### 情况 B：桥与 Hindsight 同一台机器（仅当电脑也跑 Hindsight 容器时）
 
 在 Hindsight 的 compose 里加：
 
@@ -157,11 +176,15 @@ environment:
 ```yaml
 environment:
   # ── 4 个环节统一指向桥 ──────────────────────────────────────
-  # ⚠️ BASE_URL 填**跑桥那台机器的局域网 IP**，不是 host.docker.internal
+  # 桥容器化在同一个 compose 里时用服务名直连；
+  # 桥跑在别的机器上时这里要换成那台机器的局域网 IP（见「备选」一节）
   HINDSIGHT_API_LLM_PROVIDER: openai
-  HINDSIGHT_API_LLM_BASE_URL: http://192.168.1.10:18999/v1
+  HINDSIGHT_API_LLM_BASE_URL: http://free-llm-bridge:18999/v1
   HINDSIGHT_API_LLM_API_KEY: local
   HINDSIGHT_API_LLM_MODEL: space-bunny-free
+
+  # ── ⚠️ 必须显式写：不写会踩 pg0 启动死循环，见排错 FAQ 第一条 ──
+  HINDSIGHT_API_DATABASE_URL: pg0://hindsight
 
   # ── 思考关不掉就用上限兜：thinking 是米莫方言，实测免费车道回 400 ──
   HINDSIGHT_API_LLM_EXTRA_BODY: '{"max_tokens":4096}'
@@ -177,6 +200,10 @@ environment:
 
   # ── 并发压低：免费额度按会话计，并发越高越容易撞限流 ─────────
   HINDSIGHT_API_LLM_MAX_CONCURRENT: 2
+
+  # ── 慢机器：初始化（模型加载 + 内嵌库）可能超过默认 300 秒看门狗 ──
+  HINDSIGHT_API_STARTUP_WAIT_SECONDS: 900
+  HINDSIGHT_API_MODEL_INIT_TIMEOUT: 900
 
   # ── 向量化仍然本地跑，不花钱，保持原样 ─────────────────────
   HINDSIGHT_API_EMBEDDINGS_PROVIDER: huggingface
@@ -308,20 +335,34 @@ curl -s http://127.0.0.1:18999/health | jq '{throttled, retryInSec, lanes: [.lan
 判断就绪：`curl http://127.0.0.1:8888/health` 返回 JSON。
 
 **Q: 重建后容器反复重启，日志报 `ValueError: Database URL is required for migrations`。**
-这是 Hindsight 镜像内嵌 Postgres（pg0）的**启动竞态**，与本桥的配置无关——
-pg0 的 `info()` 在 start 后偶尔返回 `uri=None`，常伴随机身上的陈旧
-`postmaster.pid`。实测表现：前 3 次启动失败，第 4 次自愈（`RestartCount=3` 后稳定），
-日志关键词 `Database URL is required for migrations` / `PostgreSQL started: None`。
 
-处置（按顺序试，多数情况第一步就够）：
-1. `docker restart hindsight` —— 实测它自己就能在几次内自愈；
-2. 若持续不愈，进容器删掉陈旧 pid 后再 restart：
-   `docker exec hindsight sh -c "rm -f /home/hindsight/.pg0/instances/hindsight/data/postmaster.pid"`；
-3. 还不行才是镜像问题（`ghcr.io/vectorize-io/hindsight:latest` 当日构建），
-   固定到某个历史 tag 或给 compose 加 healthcheck。
+**真解（实测一次生效）：compose 里显式加一行**
 
-这是**存量数据卷上的运维风险**，不是零成本改造引入的——但既然遇到了就记在这，
-复发时不用从头排查。
+```yaml
+      - HINDSIGHT_API_DATABASE_URL=pg0://hindsight
+```
+
+根因（四轮排查 + postgres 日志证据定案）：这是 Hindsight 内嵌 pg0 包装层的
+**返回值 bug**，不是数据库起不来——
+
+- postgres 每轮日志都是 `ready to accept connections`（7 轮全中，无端口冲突、
+  无权限、无磁盘、无 OOM——磁盘剩 330G、OOMKilled=false 都实测排除过）
+- pg0 的探测在库 ready **之后 6 秒**执行，拿到的仍是 `None`：
+  `PostgreSQL started: None → db_url=None → ValueError → API 退出 → 重启循环`
+- `instance.json` 每轮正确写入 pid/port，证明启动子流程成功、只有返回值算坏了
+  （`port=auto` 与实际 `5432` 的换算可疑）
+
+显式写 `pg0://hindsight` 后，URL 来自配置而不再依赖 `start()` 的返回值——
+日志随即变成 `PostgreSQL started: postgresql://hindsight:...`，循环打破
+（实测 7 分钟内 healthy，此后零重启）。
+
+> ⚠️ **以下老办法已被实测证伪，别浪费时间**：
+> - `docker restart hindsight` —— 重启多少次都复发；
+> - 删 `data/postmaster.pid` 再重启 —— 锁清干净了签名照旧（`Instance already running`
+>   消失但 `started: None` 回来）；锁不是根因。
+>
+> 另注：`PostgreSQL started: None` 是**容器重建后发作**、与 LLM 配置正交
+> （每轮重启 LLM 验证都先通过再死在库上），所以**回滚 BASE_URL 治不了它**。
 
 **Q: 日志偶发 `OutputTooLongError: LLM output exceeded token limits (scope=consolidation)`。**
 非阻塞。免费档的输出上限比 mimo 小，整合环节偶尔一次超限，Hindsight 自己会提示
