@@ -28,7 +28,22 @@ node index.js
 | --- | --- |
 | `base_url` | `http://127.0.0.1:18999/v1` |
 | `api_key` | `local`（任意非空字符串，桥不使用它） |
-| `model` | `space-bunny-free`（或 `/v1/models` 里任何一个） |
+| `model` | **`free-queue`**（推荐）或 `/v1/models` 里任何一个 |
+
+## 为什么推荐填 `free-queue`（队列哨兵）
+
+多数调用方（Hindsight 就是）**只有一个「模型名」配置项**，于是每轮都点名同一个模型。
+而免费车道的可用面**每 90 分钟就变一次**（限流窗口）——被钉死的那个迟早会撞上限流，
+然后**每个请求都要先失败一次**才换到别的。
+
+点名 `free-queue` 等于告诉桥「你看着办」：
+
+- 桥按**实测队列**取当前第一个有容量的模型；
+- 被限流的**直接跳过**，一个 RTT 都不浪费；
+- 队列是**跨车道的一条线**，不是每条车道各排各的。
+
+`free-queue` 也列在 `/v1/models` 的第一位。想钉死某个具体模型也行——
+只要它是免费档，桥就尊重你的点名。
 
 ---
 
@@ -206,6 +221,56 @@ function isFreeModel(model) {
 
 ---
 
+## 关掉思考 —— 这条车道上最大的一笔速度浪费
+
+免费档的**思考 token 与正文共享同一个 `max_tokens` 预算**。像「从一段对话里抽取事实」
+这种轻任务，模型却要先想几千 token 才吐正文——这才是单次调用动辄几十上百秒的真正原因。
+
+桥会在请求里补上关闭思考的参数，但**只给实测接受的模型补**。
+
+### 参数形状是嵌套的，不是扁平的
+
+```js
+{ reasoning: { enabled: false } }     // ✅ 正确
+```
+
+扁平的 `reasoning_effort` / `enable_thinking` / `thinking` **形状不对**：对部分车道直接
+502，对另一些被静默忽略（`reasoning_tokens` 照旧）。这个形状与 Our Free Model 插件
+catalog 里每个模型的 `effortOffPatch` 一致。
+
+### ⚠️ 绝不能全局施加
+
+上游对思考参数的处理**因模型而异**。同一份补丁：
+
+| 模型 | 加 `{"reasoning":{"enabled":false}}` |
+| --- | --- |
+| `nvidia/nemotron-3-super-120b-a12b:free` | ✅ 200，`reasoning_tokens` 41 → **0** |
+| `cohere/north-mini-code:free` | ✅ 200，rt 32 → **0** |
+| `nemotron-3.5-lightning-free` | ✅ 200，rt 136 → **0** |
+| `kilo-auto/free` | ⚠️ 200 但 rt 仍 54（关不干净） |
+| **`liquid/lfm-2.5-2.6b:free`** | ❌ **502** |
+
+最后一行是教训的来源：上游原文 `Reasoning is mandatory for this endpoint and cannot be
+disabled`。桥是**跨车道故障转移**的，一个全局参数最终会打到任意模型上——那等于用
+一个模型的方言去毒另一个模型。实测把思考参数写进 Hindsight 的全局 `EXTRA_BODY` 后，
+原本能成功的 `liquid` 调用开始成片 502。
+
+所以桥维护一张**实测通过**的名单 `THINKING_OFF_MODELS`，并按**本次实际目标模型**施加：
+故障转移换模型后会重新判定。
+
+### 收益（2026-10-06 实测，Hindsight 真实负载）
+
+| 环节 | 改造前 | 改造后 | 思考 token |
+| --- | --- | --- | --- |
+| `retain_extract_facts` | 431.3 s | **51.1 s** | 3195 → **0** |
+| `consolidation` | 199.5 s | **36.3 s** | 3915 → **0** |
+
+`/health` 里的 `thinkingOffModels` 会报出当前哪些模型在名单里。
+
+重新验证：`node scripts/probe-thinking.mjs`
+
+---
+
 ## API
 
 | 方法 | 路径 | 说明 |
@@ -233,12 +298,20 @@ function isFreeModel(model) {
 ## 测试
 
 ```bash
-node test-free-only.mjs   # 零成本保证 + 会话亲和 + 指纹门 + schema 规整 + 文档一致性。不出网，秒级
+node test-free-only.mjs   # 零成本保证 + 会话亲和 + 指纹门 + schema 规整 + 关思考 + 队列哨兵 + 文档一致性。不出网，秒级
 node test-multilane.mjs   # 多车道故障转移。起两个本地假上游，不出网，秒级
 node test-degradation.mjs # 全部车道不可用时的降级行为。不出网，秒级
 node smoke.mjs            # 端到端。真打上游，会消耗免费额度
 node soak.mjs             # 持续性 + 故障转移。真打上游
+node scripts/probe-thinking.mjs  # 免费模型分诊。真打上游，会消耗一点免费额度
 ```
+
+`scripts/probe-thinking.mjs` 是**换模型/调队列时的第一步**：它一次量完直连命中率、
+延迟 p50、思考可否关、JSON 合规四项，并在末尾输出**可直接照抄进 `index.js`** 的名单
+（哪些能关思考、哪些加了会 502、哪些本轮直连可用）。
+
+⚠️ 它只测「直连命中」而不是单次延迟——**单次延迟会骗人**。曾把某模型的一次 931ms
+误判为「快 100 倍」，随后 20 连发全部被路由走（429）。命中率才是可靠的。
 
 前三条都不出网（全部用本地 mock 上游），`npm test` 会依次跑完。
 CI 对每个 push 和 PR 都在 **Node 22.19 / 24.x 两个版本**上跑这套断言——
@@ -334,24 +407,33 @@ environment:
 > 这一节请认真读。这个项目最容易被误解的地方全在这里，而且**大部分结论都是我实测出来的，
 > 不是从上游文档或插件 README 抄的**——两者在关键一点上不一致（见下）。
 
-- **⚠️ 同一时刻只有 1 个模型可直连。** 13 个 `-free` 里只有 `space-bunny-free` 此刻可用；
-  `fledge-alpha-free`、`nemotron-3-ultra-free`、`nemotron-3.5-lightning-free`、
-  `longcat-2.5-preview-free` **永久** 403 `OpenCode's free tier can only be used from
-  within OpenCode`——上游按**调用来源**限制，不按请求头（`space-bunny-free` 不带任何
-  指纹头也能成功）。桥会把这 4 个移出候选池并在遇到它们时自动换档。
-- **⚠️ 但那 5 个 429 不是永久失效。** 它们带 `retry-after: ~5400s`（90 分钟量级），
+- **⚠️ 「哪些模型可用」是时效性的，别凭记忆改。** 上游限流窗口约 90 分钟，可用面会来回变。
+  2026-10-06 复测就推翻了两条旧结论：
+  - 旧结论「同一时刻只有 `space-bunny-free` 可直连」→ 实测 `space-bunny-free` **0/4**，
+    而 `nemotron-3.5-lightning-free` 4/4、`nvidia/nemotron-3-super-120b-a12b:free` 4/4。
+  - 旧结论「`fledge-alpha-free` / `nemotron-3-ultra-free` / `nemotron-3.5-lightning-free` /
+    `longcat-2.5-preview-free` **永久** 403 opencode-only」→ 其中三个**上游已放开**
+    （3/4、3/4、4/4 直连成功）。所以这里**不再硬编**「谁是 opencode-only」；
+    桥在运行时遇到 403 才把它摘掉，`test-free-only.mjs` 验的也是这个机制而非名单。
+
+  **重排队列或改关思考名单之前，先跑 `node scripts/probe-thinking.mjs`。**
+- **⚠️ 429 不是永久失效。** 限流带 `retry-after: ~5400s`（90 分钟量级），
   实测真实递减（`5425 → 5416 → 5405`），即**速率限制、到点自动恢复**。
   桥尊重上游给的时长而不是一律 60 秒——否则会在一个半小时的窗口里反复撞同一面墙。
   复现：`node scripts/probe-throttled-depth.mjs`、`node scripts/probe-retry-after.mjs`。
 - **⚠️ 别再找别的免密白嫖了，真没有了。** 实测 11 家（`node scripts/probe-keyless.mjs`）：
-  只有 OpenCode 这一家不带 key 也能调；智谱、OpenRouter、SiliconFlow、Kimi、Cerebras、
-  Groq、NVIDIA、Cloudflare **全部要 key**。顺带确认 `/zen/go/v1` 这条路径也回
+  只有 OpenCode 与 Kilo 这两家不带 key 也能调；智谱、OpenRouter、SiliconFlow、Kimi、
+  Cerebras、Groq、NVIDIA、Cloudflare **全部要 key**。顺带确认 `/zen/go/v1` 这条路径也回
   `401 Missing API key`——它是计费路径，不是第二条免密车道。
-  **所以「第二条车道」的现实形态是自己注册一个免费 key**，见上面「多车道」。
-- **故障转移是有序且有界的。** 先同车道换模型，再换车道；每个 `lane:model` 最多一次，
-  总跳数上限 `MAX_FAILOVER_HOPS`（默认 16）。实测主车道 7 个候选全挂时，
-  桥一次请求打 7 次上游然后交给备用车道——不会打转，但也确实试了 7 次。
-  想更快放弃可以调小它。
+  **所以「多几条车道」的现实形态是自己注册免费 key**，见上面「多车道」。
+- **故障转移走的是同一条队列。** 桥把所有车道的所有免费模型排成**一条线**
+  （`QUEUE_ORDER` / `queueTargets`），「首选」和「故障转移」用的是同一个顺序——
+  旧实现里两者遍历顺序不同，于是首选挑了一个、失败后又从另一顺序的头上开始，
+  可能把刚失败的再试一遍。每个 `lane:model` 最多一次，总跳数上限
+  `MAX_FAILOVER_HOPS`（默认 16）。
+- **⚠️ 智谱（`glm`）只做兜底，别当主力。** 它的免费额度有限且有期限，
+  所以 `QUEUE_ORDER` 里**故意没有它**——它只作为独立车道排在所有免费车道之后，
+  用于「所有免费模型都暴毙」的场合。
 - **插件的探测结果会骗人。** `dsh-our-free-model` 的设置页显示那些模型「available」，
   但那是它在 DSH 进程里探测的——上游把它当成 OpenCode 内部流量。**第三方工具照抄这个
   清单会踩空。** 想确认就自己跑 `node scripts/probe-free-models.mjs`。

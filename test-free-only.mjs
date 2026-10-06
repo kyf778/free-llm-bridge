@@ -11,7 +11,7 @@
 
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import { pickModel, applyFingerprint, sessionForConversation, requestIdFor, normalizeResponseFormat, upstreamFailure } from './index.js'
+import { pickModel, applyFingerprint, sessionForConversation, requestIdFor, normalizeResponseFormat, upstreamFailure, thinkingOffPatch, supportsThinkingOff, FALLBACK_ORDER, isQueueSentinel } from './index.js'
 
 let failures = 0
 
@@ -81,31 +81,32 @@ test('地区受限的免费模型被拒绝并说明原因', () => {
   assert.match(decision.error, /region-blocked/)
 })
 
-test('opencode-only 的模型换到可用档，而不是回 403', () => {
-  // 上游对这几个模型写明「free tier can only be used from within OpenCode」。
-  // 换个模型就能成，所以应该降级成换档，而不是把 403 透给调用方。
-  for (const dead of ['fledge-alpha-free', 'nemotron-3-ultra-free', 'nemotron-3.5-lightning-free', 'longcat-2.5-preview-free']) {
-    const decision = pickModel(dead, UPSTREAM_LIST)
-    assert.ok(decision.model !== undefined, `${dead} should fail over, not error`)
-    assert.notEqual(decision.model, dead)
-    assert.match(decision.model, /-free$/, `${dead} failed over to a paid model: ${decision.model}`)
-  }
-})
+test('opencode-only 的 403 会把该模型从候选池里摘掉（动态保护）', () => {
+  // 上游对某些模型会回 403「free tier can only be used from within OpenCode」。
+  // 换一个模型就能成，所以桥应该把它记进 KNOWN_OPENCODE_ONLY 并降级换档。
+  //
+  // ⚠️ 这里**故意不硬编一张「谁是 opencode-only」的名单**。曾经硬编过
+  // （fledge-alpha-free / nemotron-3-ultra-free / nemotron-3.5-lightning-free /
+  // longcat-2.5-preview-free），2026-10-06 复测发现上游**已经放开**了其中三个：
+  //
+  //   fledge-alpha-free           直连 3/4   （旧结论：永久 403）
+  //   nemotron-3.5-lightning-free 直连 4/4   （旧结论：永久 403）
+  //   nemotron-3-ultra-free       直连 3/4   （旧结论：永久 403）
+  //   longcat-2.5-preview-free    直连 0/4   （被限流，不是 403）
+  //
+  // 硬编名单会随上游政策变化而**变成谎言**，所以改为验证机制本身：
+  // 注入一次 403 → 该模型必须被摘掉。名单由运行时发现，不由测试假设。
+  const lane = { name: 'zen', baseUrl: 'https://opencode.ai', model: 'space-bunny-free' }
+  const victim = 'some-opencode-only-free'
+  const failure = upstreamFailure(403, "OpenCode's free tier can only be used from within OpenCode", lane, victim)
+  assert.equal(failure.ok, false)
+  assert.match(failure.message, /restricted to OpenCode-internal calls/)
 
-test('opencode-only 模型永不进入故障转移链', () => {
-  // 它们对第三方一律 403。留在候选池里只会把同一个失败换个模型名重演一遍。
-  for (const dead of ['fledge-alpha-free', 'nemotron-3.ultra-free', 'nemotron-3.5-lightning-free', 'longcat-2.5-preview-free']) {
-    // 把 dead 排到第一位，其余全部标记为不可用，验证不会选中它。
-    const decision = pickModel('', ['fledge-alpha-free'])
-    assert.ok(decision.error !== undefined || !decision.model.startsWith('fledge'),
-      `opencode-only model ${dead} must not be selected`)
-  }
-})
-
-test('fault injection: 只有 space-bunny 时，换档目标不会跑到付费模型', () => {
-  const decision = pickModel('fledge-alpha-free', [])
-  // 候选池被 opencode-only 与 region-blocked 清空后，要么报可用性错误，要么给一个免费档。
-  if (decision.model !== undefined) assert.match(decision.model, /-free$/)
+  // 摘掉之后，再点名它就必须换档，而不是原样返回它。
+  const decision = pickModel(victim, [...UPSTREAM_LIST, victim])
+  assert.ok(decision.model !== undefined, 'should fail over to another free model, not error')
+  assert.notEqual(decision.model, victim, 'the 403 model must not be selected again')
+  assert.match(decision.model, /-free$/, `failed over to a paid model: ${decision.model}`)
 })
 
 test('故障转移的每一个候选都是免费档', () => {
@@ -372,6 +373,95 @@ test('response_format 只发给声明支持的车道', async () => {
   // 官方文档写「支持结构化输出」不等于 OpenAI 兼容层接受 json_schema。
   const source = await readFile(new URL('./index.js', import.meta.url), 'utf8')
   assert.match(source, /else\s*delete payload\.response_format/, 'must delete response_format for lanes that cannot use it')
+})
+
+process.stdout.write('\nthinking-off (the biggest speed win on this lane)\n')
+
+/**
+ * 关思考是这条车道上**最大的一笔速度浪费**：思考 token 与正文共享同一个
+ * `max_tokens` 预算，免费档动辄先想几千 token 才吐正文。实测关掉之后：
+ *
+ *   cohere/north-mini-code:free   7977ms →  919ms
+ *   nemotron-3.5-lightning-free   7362ms → 1381ms
+ *   nvidia/nemotron-3-super-120b  1489ms → 1045ms
+ *
+ * 但**绝不能全局施加**：`liquid/lfm-2.5-2.6b:free` 收到同一份补丁直接回 502。
+ * 桥是跨车道故障转移的，全局参数最终会打到任意模型上——那等于用一个模型的
+ * 方言去毒另一个模型（实测把 reasoning_effort 写进全局 EXTRA_BODY 后，
+ * 原本能成功的 liquid 调用开始成片 502）。
+ */
+test('关思考只对实测接受的模型施加，名单外的模型一个字节都不改', () => {
+  // 实测能关且 reasoning_tokens 归零的
+  assert.deepEqual(thinkingOffPatch('nvidia/nemotron-3-super-120b-a12b:free'),
+    { reasoning: { enabled: false } })
+  assert.deepEqual(thinkingOffPatch('nemotron-3.5-lightning-free'),
+    { reasoning: { enabled: false } })
+  assert.equal(supportsThinkingOff('cohere/north-mini-code:free'), true)
+
+  // 实测加补丁会 502 的 —— 必须**不在**名单里
+  assert.equal(thinkingOffPatch('liquid/lfm-2.5-2.6b:free'), undefined,
+    'liquid 502s on the thinking patch; it must never be patched')
+  assert.equal(supportsThinkingOff('liquid/lfm-2.5-2.6b:free'), false)
+
+  // 完全没测过的模型也必须不动它（保守默认）
+  assert.equal(thinkingOffPatch('some-unknown-model-free'), undefined)
+  assert.equal(thinkingOffPatch(''), undefined)
+  assert.equal(thinkingOffPatch(undefined), undefined)
+})
+
+test('补丁是嵌套 reasoning 形状，不是被忽略的扁平方言', () => {
+  // 实测扁平形状（reasoning_effort / enable_thinking / thinking）对部分车道
+  // 直接 502，对另一些被静默忽略（reasoning_tokens 照旧）。正确形状是嵌套的，
+  // 与插件 catalog 的 effortOffPatch 一致。
+  const patch = thinkingOffPatch('nemotron-3.5-lightning-free')
+  assert.ok(patch.reasoning !== undefined, 'must be the nested reasoning shape')
+  assert.equal(patch.reasoning.enabled, false)
+  assert.equal(patch.reasoning_effort, undefined, 'flat reasoning_effort is the wrong shape')
+  assert.equal(patch.enable_thinking, undefined)
+  assert.equal(patch.thinking, undefined)
+})
+
+test('返回的补丁是副本，改它不会污染全局名单', () => {
+  const a = thinkingOffPatch('nemotron-3.5-lightning-free')
+  a.reasoning.enabled = true
+  const b = thinkingOffPatch('nemotron-3.5-lightning-free')
+  assert.equal(b.reasoning.enabled, false, 'the shared table must not be mutable from outside')
+})
+
+process.stdout.write('\nqueue sentinel (let the bridge pick, instead of pinning one model)\n')
+
+/**
+ * 调用方（Hindsight）只有一个 `LLM_MODEL` 配置项，所以它**每轮都点名同一个模型**。
+ * 没有哨兵时队列只在故障转移时生效：首选永远是被钉死那个，它一限流，
+ * 每轮都要先撞一次墙才换——「一个用不了就换下一个」退化成「每次先失败一次」。
+ *
+ * 点名哨兵则把选择权交给桥：直接取队列里第一个有容量的。
+ */
+test('队列哨兵被当作「你自己挑」，而不是一个模型名', () => {
+  for (const sentinel of ['free-queue', 'auto', 'queue', 'FREE-QUEUE']) {
+    const decision = pickModel(sentinel, UPSTREAM_LIST)
+    assert.equal(decision.error, undefined, `${sentinel} must resolve, got: ${decision.error}`)
+    assert.ok(decision.model !== undefined, `${sentinel} must resolve to a model`)
+    assert.match(decision.model, /-free$/, `${sentinel} resolved to a paid model: ${decision.model}`)
+    assert.ok(decision.lane !== undefined)
+  }
+})
+
+test('哨兵选出来的是队列里第一个有容量的，而不是被钉死的某个模型', () => {
+  const decision = pickModel('free-queue', UPSTREAM_LIST)
+  // 必须落在 FALLBACK_ORDER 里（队列成员），不能是名单外的模型。
+  assert.ok(FALLBACK_ORDER.includes(decision.model),
+    `sentinel picked ${decision.model}, which is not in the queue`)
+  // 且必须是队列里的**第一个**——否则「跳过被限流的」这个目的就没达到。
+  assert.equal(decision.model, FALLBACK_ORDER[0],
+    `sentinel must pick the head of the queue, got ${decision.model}`)
+})
+
+test('哨兵不是「付费模型」——不能因为不在 -free 名单里被拒', () => {
+  // 这是最容易写错的一处：校验逻辑若在哨兵转换之前跑，
+  // 'free-queue' 会因为不以 -free 结尾而被判成付费模型，直接 400。
+  const decision = pickModel('free-queue', UPSTREAM_LIST)
+  assert.equal(decision.error, undefined, 'the sentinel must not trip the paid-model guard')
 })
 
 process.stdout.write('\nthrottle window (respecting the upstream)\n')

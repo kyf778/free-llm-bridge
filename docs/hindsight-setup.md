@@ -192,15 +192,29 @@ environment:
       HINDSIGHT_API_LLM_PROVIDER: openai
       HINDSIGHT_API_LLM_BASE_URL: http://free-llm-bridge:18999/v1
       HINDSIGHT_API_LLM_API_KEY: local
-      HINDSIGHT_API_LLM_MODEL: space-bunny-free
+      # ⚠️ 推荐填队列哨兵，而不是某个具体模型。
+      #    Hindsight 每轮都点名同一个模型，而免费车道的可用面每 90 分钟就变一次——
+      #    钉死的那个迟早撞上限流，然后每个请求都要先失败一次才换。
+      #    填 free-queue 则由桥按实测队列挑选，直接跳过被限流的，一个 RTT 都不浪费。
+      HINDSIGHT_API_LLM_MODEL: free-queue
+      # ⚠️ 必须固定 worker_id。默认取 hostname（容器内即容器 ID），重建就变；
+      #    而 Hindsight 只回收「自己」的 processing 行，上一个容器留下的会永久卡死。
+      #    官方自己的启动日志也会警告这一点。
+      HINDSIGHT_API_WORKER_ID: hindsight
 
       # ② 显式 postgresql://：让 Hindsight 完全不走 pg0 的探测代码路径。
       #    注意：单写这行会跳过 postgres 启动（没人启动它）；单写 pg0://
       #    又会在慢机器上踩返回值 None。两者必须配对，详见排错 FAQ 第一条。
       HINDSIGHT_API_DATABASE_URL: postgresql://hindsight:hindsight@127.0.0.1:5432/hindsight
 
-      # ── 思考关不掉就用上限兜：thinking 是米莫方言，实测免费车道回 400 ──
-      HINDSIGHT_API_LLM_EXTRA_BODY: '{"max_tokens":4096}'
+      # ── 关思考交给桥做，不要在 Hindsight 侧配 ──────────────────
+      # 桥会按**本次实际模型**决定是否加 {"reasoning":{"enabled":false}}。
+      # ⚠️ 绝不能在这里写思考相关的参数：EXTRA_BODY 会合并进**每一次** LLM 调用，
+      #    而它最终打到哪个模型是不确定的。实测 nemotron-3-super 加它能把
+      #    reasoning_tokens 压到 0，而 liquid/lfm-2.5-2.6b 加同一个参数直接 502
+      #    （上游原文：Reasoning is mandatory for this endpoint and cannot be disabled）。
+      #    这里只留 max_tokens 兜输出上限。
+      HINDSIGHT_API_LLM_EXTRA_BODY: '{"max_tokens":8192}'
 
       # ── 超时必须放宽：免费车道思考期可能静默 60-70 秒 ─────────────
       HINDSIGHT_API_LLM_TIMEOUT: 600
@@ -346,6 +360,55 @@ curl -s http://127.0.0.1:18999/health | jq '{throttled, retryInSec, lanes: [.lan
 
 改完 `docker compose up -d` 重建，等初始化完成（慢机器上 5-8 分钟是正常的）。
 判断就绪：`curl http://127.0.0.1:8888/health` 返回 JSON。
+
+**Q: 容器起来了但 8888 一直不通，日志停在 `Load pretrained SentenceTransformer`。**
+
+**嵌入模型缓存在容器可写层里，不在任何卷上**——每次重建容器都要重新下载
+（`paraphrase-multilingual-MiniLM-L12-v2` 约 470 MB）。一旦这次下载卡住
+（实测停在 10 MiB 不动，`blobs/*.incomplete` 大小不变），SentenceTransformer 就会
+一直等，`Application startup failed. Exiting.`。
+
+解法：把模型**预下载到宿主机一个持久目录**再挂进去，让容器永远不必联网。
+
+```bash
+# 宿主机上（能通 hf-mirror 的话）
+mkdir -p ./embed-model
+BASE=https://hf-mirror.com/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2/resolve/main
+for f in config.json config_sentence_transformers.json modules.json \
+         sentence_bert_config.json model.safetensors tokenizer.json \
+         tokenizer_config.json special_tokens_map.json sentencepiece.bpe.model; do
+  curl -fsSL -o "./embed-model/$f" "$BASE/$f"
+done
+mkdir -p ./embed-model/1_Pooling
+curl -fsSL -o ./embed-model/1_Pooling/config.json "$BASE/1_Pooling/config.json"
+```
+
+```yaml
+    volumes:
+      - ./embed-model:/models/embed:ro
+    environment:
+      - HINDSIGHT_API_EMBEDDINGS_LOCAL_MODEL=/models/embed
+      - HF_ENDPOINT=https://hf-mirror.com
+```
+
+⚠️ 校验下载完整性再挂：`model.safetensors` 应约 470 MB 且头部可解析
+（`1_Pooling/config.json` 也必须存在，否则报
+`Pooling.__init__() missing 1 required positional argument`）。
+实测一次「下载中途卡住留下的残缺文件」正是上面那个报错的来源。
+
+**Q: 重建后一部分操作永远停在「处理中」。**
+
+`worker_id` 默认取 hostname（容器内即容器 ID），容器一重建就变。而 Hindsight 的
+`_reclaim_own_processing_tasks` **只回收自己 worker_id 的行**，于是上一个容器留下的
+`processing` 行没人认领，永久卡死（实测卡过 4~6 个 retain）。
+
+修法：固定 `HINDSIGHT_API_WORKER_ID`（见上文 compose 样例）。
+已卡死的行可以这样解冻：
+
+```sql
+UPDATE async_operations SET status='pending', worker_id=NULL, claimed_at=NULL
+WHERE status='processing' AND (worker_id IS NULL OR worker_id <> '<你固定的那个 id>');
+```
 
 **Q: 重建后容器反复重启，日志报 `ValueError: Database URL is required for migrations`。**
 

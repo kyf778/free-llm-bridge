@@ -175,40 +175,132 @@ const PRIMARY_LANE = LANES[0]
 /**
  * 兜底模型顺序：首选被限流时沿这条线往下找。
  *
- * ## 排序依据（2026-10-05 更新：以**运行时实测**为准，覆盖探针单次结论）
+ * ## 排序依据（2026-10-06 全量实测重排）
  *
- * 探针（scripts/probe-free-models.mjs）是**单次直连**上游测的，而桥的运行时
- * 日志积累了 20 小时、上千次真实调用的链式结果（`X unusable; retrying on Y`
- * 里的计数就是 X 的失败次数，Y 被尝试的次数 = X 的失败次数）。两者对
- * `jev-1.13-free` 的结论相反——探针说 ❌500，运行时它 237 次尝试成功 170 次。
- * 大样本运行时数据优先，故把 jev 提到第二位。各模型的**条件成功率**
- * （只在前一个失败后才被尝试，条件更差仍能成的更稳）：
+ * 这份顺序直接决定**每次请求要白等几个 RTT**：桥按顺序试，前面挂了的模型
+ * 每个都要打完一次才轮到下一个。实测那一刻 zen 车道 11 个候选里只有 2 个可用，
+ * 而旧顺序把 `space-bunny-free`（已限流）放在第一位——于是每个请求都先撞一次墙。
+ *
+ * ### 本轮实测（`node scripts/probe-thinking.mjs`，2026-10-06）
+ *
+ * 直连命中 = `response.model === 请求的 model`，**单次延迟不算数**（曾因此误判）。
+ *
+ *   模型                            直连   延迟      关思考后
+ *   nvidia/nemotron-3-super-120b…   ✅    1433ms    ✅ rt=0, 1045ms   ← 最优
+ *   nemotron-3.5-lightning-free     ✅    7362ms    ✅ rt=0, 1381ms
+ *   nemotron-3-ultra-free           ✅    9624ms    ✅ rt=0
+ *   cohere/north-mini-code:free     ✅    7977ms    ✅ rt=0,  919ms
+ *   kilo-auto/free                  ✅    2934ms    ⚠️ rt=54（关不干净）
+ *   liquid/lfm-2.5-2.6b:free        ✅    2961ms    ❌ 502（**不能加补丁**）
+ *   fledge-alpha-free               ✅    1561ms    —
+ *   glm-4-flash-250414              ✅     999ms    ✅（兜底车道，永远最后）
+ *
+ *   以下当时**直连失败**（被限流，桥自动转给了别的模型）——保留在池子里，
+ *   限流约 90 分钟后会恢复，届时它们仍应被用到，只是排在后面：
+ *   space-bunny-free, jev-1.13-free, ling-3.1-flash-free, mimo-v2.5-free,
+ *   mimo-v2.6-flash-free, deepseek-v4-flash-free, ling-3.0-flash-fin-free,
+ *   longcat-2.5-preview-free, dots-studio/dots-3-note-preview:free,
+ *   poolside/laguna-s-2.1:free
+ *
+ * ### 历史数据（2026-10-05，20 小时运行时统计的条件成功率）
  *
  *   space-bunny-free       754/991 ≈76%（首选，端到端 86.8% 含兜底）
- *   jev-1.13-free          170/237 ≈72%   ← 探针误判为不可用
- *   ling-3.1-flash-free    12/12  =100%（样本小，排第三）
+ *   jev-1.13-free          170/237 ≈72%   ← 探针曾误判为不可用
+ *   ling-3.1-flash-free    12/12  =100%（样本小）
  *   mimo-v2.5-free         11/24  ≈46%
  *   mimo-v2.6-flash-free   17/41  ≈41%
  *   deepseek-v4-flash-free 26/67  ≈39%
  *   ling-3.0-flash-fin-free 1/13  ≈8%（最差，垫底）
  *
- * 这几个被**排除**在顺序之外，因为它们对第三方调用一律 403
- * `FreeTierError: OpenCode's free tier can only be used from within OpenCode`——
- * 换过去只是把同一个失败换个模型名重演一遍，白等一个 RTT：
- *   longcat-2.5-preview-free, nemotron-3-ultra-free,
- *   nemotron-3.5-lightning-free, fledge-alpha-free
- * 对照实验：space-bunny 不带 x-opencode-* 也能成功，所以这不是请求头问题，
- * 是上游对那几个模型按来源做了硬限制。
+ * 两组数据不冲突：历史成功率说明**长期**谁稳，本轮直连说明**此刻**谁活着。
+ * 所以把本轮实测可用的排前（省 RTT），历史可靠的紧随其后（限流恢复后接上）。
+ *
+ * ⚠️ **这份名单是时效性的**。上游限流窗口约 90 分钟，可用面会来回变。
+ * 重排前请重跑 `node scripts/probe-thinking.mjs`，不要凭记忆改。
  */
 const FALLBACK_ORDER = [
+  // —— 本轮实测直连可用（限流恢复快、延迟低）——
+  'nemotron-3.5-lightning-free',
+  'nemotron-3-ultra-free',
+  'fledge-alpha-free',
+  // —— 历史条件成功率最高（限流恢复后应回到最前）——
   'space-bunny-free',
   'jev-1.13-free',
   'ling-3.1-flash-free',
   'mimo-v2.5-free',
   'mimo-v2.6-flash-free',
   'deepseek-v4-flash-free',
+  // —— 历史最差，垫底 ——
   'ling-3.0-flash-fin-free',
+  'longcat-2.5-preview-free',
 ]
+
+/**
+ * 导出给测试用：多车道测试需要给「主车道的每一个候选」都脚本化 429，
+ * 才能验证「主车道穷尽 → 换车道」。硬编名单会在重排后悄悄漏掉新候选，
+ * 那个没被脚本化的模型就以默认 200 成功，把剧本打断在半路——
+ * 这个 bug 2026-10-05 与 2026-10-06 各踩过一次，所以改成从源头取。
+ */
+export { FALLBACK_ORDER }
+
+/**
+ * 跨车道的**统一队列顺序** —— 用户要的「一个队列，免费模型在前，一个用不了就换下一个」。
+ *
+ * ## 为什么需要跨车道排（而不是每条车道各排各的）
+ *
+ * 旧结构里每条非主车道都把 `lane.model` 硬钉在第一位。kilo 车道的 `lane.model`
+ * 是 `liquid/lfm-2.5-2.6b:free`，而实测它**思考无法关闭**
+ * （上游原文：`Reasoning is mandatory for this endpoint and cannot be disabled`），
+ * 加思考补丁直接 502。于是每个请求都先打这个又慢又脆的模型，才轮到真正好的
+ * `nemotron-3-super`——白等一个 RTT。
+ *
+ * 排名的唯一依据是**实测**（`node scripts/probe-thinking.mjs`），不是模型名气。
+ *
+ * ## 分层
+ *
+ *   1. 实测直连可用 + 能关思考（最快）
+ *   2. 实测直连可用（思考关不掉，但仍快）
+ *   3. 历史上稳、本轮被限流（约 90 分钟后恢复）
+ *   4. 实测表现最差
+ *
+ * `glm-4-flash-250414` **故意不在这里** —— 它是「所有免费模型都暴毙」时的兜底，
+ * 额度有限且有期限，绝不能当主力。它只作为独立车道排在所有免费车道之后。
+ */
+const QUEUE_ORDER = [
+  // —— 1. 直连可用且能关思考（实测最快）——
+  'nvidia/nemotron-3-super-120b-a12b:free',   // 1433ms，关思考 rt=0
+  'cohere/north-mini-code:free',              // 7977ms → 关思考 919ms
+  'nemotron-3.5-lightning-free',              // 7362ms → 关思考 1381ms
+  'nemotron-3-ultra-free',                    // 9624ms，关思考 rt=0
+  // —— 2. 直连可用但思考关不干净（仍比限流档快）——
+  'kilo-auto/free',                           // 2934ms，rt 关不到 0
+  'liquid/lfm-2.5-2.6b:free',                 // ⚠️ 思考强制开启，绝不能加补丁
+  'fledge-alpha-free',                        // 1561ms，无 reasoning 字段
+  // —— 3. 历史上稳、本轮被限流（约 90 分钟后恢复）——
+  'space-bunny-free',
+  'jev-1.13-free',
+  'ling-3.1-flash-free',
+  'mimo-v2.5-free',
+  'mimo-v2.6-flash-free',
+  'deepseek-v4-flash-free',
+  'dots-studio/dots-3-note-preview:free',
+  'poolside/laguna-s-2.1:free',
+  // —— 4. 实测最差，垫底 ——
+  'ling-3.0-flash-fin-free',
+  'longcat-2.5-preview-free',
+]
+
+export { QUEUE_ORDER }
+
+/**
+ * 队列里的名次。不在名单里的模型排在最后（保持稳定，不打乱既有相对顺序）。
+ * @param {string} model
+ * @returns {number}
+ */
+function queueRank(model) {
+  const index = QUEUE_ORDER.indexOf(model)
+  return index < 0 ? QUEUE_ORDER.length : index
+}
 
 /** 已被实测判定在 CN 出口不可用的模型，跳过探测以免每次启动都烧配额。 */
 const KNOWN_REGION_BLOCKED = new Set([
@@ -246,6 +338,88 @@ function isFreeModel(model) {
  * 纯批处理没有真实工具，于是发自禁用的诱饵：模型即使去调，返回也不可用。
  */
 const FINGERPRINT_TOOLS = ['bash', 'glob', 'grep', 'read']
+
+// ---------------------------------------------------------------------------
+// 关闭思考 —— 免费档最大的一笔速度浪费
+// ---------------------------------------------------------------------------
+
+/**
+ * 「关闭思考」的参数补丁形状。
+ *
+ * 实测（2026-10-06）这个形状是**嵌套**的 `{"reasoning":{"enabled":false}}`，
+ * 与 Our Free Model 插件 catalog 里每个模型的 `effortOffPatch` 完全一致。
+ * 扁平的 `reasoning_effort` / `enable_thinking` / `thinking` **形状不对**：
+ * 它们对部分车道直接回 502，且对另一些模型被静默忽略（reasoning_tokens 照旧）。
+ */
+const THINKING_OFF_PATCH = { reasoning: { enabled: false } }
+
+/**
+ * 实测**接受**关闭思考、且 `reasoning_tokens` 确实归零的模型。
+ *
+ * ## 为什么必须是逐模型的名单，不能全局配
+ *
+ * 上游对思考参数的处理**因模型而异**：同一份 `{"reasoning":{"enabled":false}}`，
+ * `nvidia/nemotron-3-super-120b-a12b:free` 接受并把 reasoning 压到 0，
+ * 而 `liquid/lfm-2.5-2.6b:free` **直接回 502**。
+ *
+ * 桥是**跨车道故障转移**的（`payload = {...body, model}` 原样透传），所以一个
+ * 全局参数最终会打到任意模型上——那等于用一个模型的方言去毒另一个模型。
+ * 实测教训：把 `reasoning_effort` 写进 Hindsight 的全局 `EXTRA_BODY` 后，
+ * 原本能成功的 liquid 调用开始成片 502。
+ *
+ * 所以名单**只收实测通过的模型**；不在名单里的一个字节都不加。
+ * 这与插件 catalog 的 `canDisableThinking` 一致，但以本桥的实测为准。
+ *
+ * ## 收益（Hindsight 的轻任务最吃这一口）
+ *
+ * 免费档的思考 token 与正文**共享同一个 `max_tokens` 预算**，思考几千 token
+ * 才吐正文，正是这些调用动辄 7~14 秒的原因。实测关闭后：
+ *
+ *   nvidia/nemotron-3-super-120b-a12b:free   1489ms → 1045ms（rt 41 → 0）
+ *   cohere/north-mini-code:free              7977ms →  919ms（rt 32 → 0）
+ *   nemotron-3.5-lightning-free              7362ms → 1381ms（rt 136 → 0）
+ *
+ * 记忆提取/整合是「照抄事实」的轻任务，不需要思考——省下的正是纯浪费。
+ *
+ * 重新验证：`node scripts/probe-thinking.mjs`
+ */
+const THINKING_OFF_MODELS = new Set([
+  // —— 实测 reasoning_tokens 归零 ——
+  'nvidia/nemotron-3-super-120b-a12b:free',
+  'cohere/north-mini-code:free',
+  'nemotron-3.5-lightning-free',
+  'nemotron-3-ultra-free',
+  'nemotron-3.5-lightning:free',
+  'nemotron-3-ultra-550b-a55b:free',
+  'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
+  'glm-4-flash-250414',
+])
+
+/**
+ * 这个模型该不该关思考。
+ *
+ * 只对**实测接受**的模型返回补丁；其余返回 undefined，请求一个字节都不改。
+ * 调用方自己传了 `reasoning` 时不覆盖——显式意图优先于本桥的默认。
+ *
+ * 返回的是**深拷贝**：调用方（或未来某个 `Object.assign` 的意外）改到内层对象时，
+ * 不能污染这张全局名单，否则「哪些模型能关思考」会随运行悄悄漂移。
+ *
+ * @param {string} model 模型名
+ * @returns {object|undefined} 要合并进请求体的补丁
+ */
+export function thinkingOffPatch(model) {
+  if (!THINKING_OFF_MODELS.has(model)) return undefined
+  return { reasoning: { ...THINKING_OFF_PATCH.reasoning } }
+}
+
+/**
+ * 这个模型是否在「关思考」名单里（给 /health 与探针用）。
+ * @param {string} model
+ * @returns {boolean}
+ */
+export function supportsThinkingOff(model) {
+  return THINKING_OFF_MODELS.has(model)
+}
 
 /** 每条车道各自的限流退避：key 为 `lane:model`，被限流后暂停到这个时刻。 */
 const COOLDOWN_UNTIL = new Map()
@@ -549,39 +723,72 @@ function candidatesFor(lane) {
     return pool
   }
 
-  // 主车道有多模型可用，按实测排序。
+  // 主车道有多模型可用，**完全按实测排序**决定顺序。
   //
   // `source` 是上游的完整清单（86 个，绝大多数是付费档），所以每一项都要过
   // `allowed()` 过滤——直接把 source 塞进 ordered 会让 /health 报出 86 个候选，
   // 而实测能直连的只有 1 个。那种数字比没有更糟：它会让人以为有冗余。
   //
-  // 排序按 `FALLBACK_ORDER` 的名次，而**不改变候选池的成员**：池子仍以
-  // `source` 为准，只是顺序由实测成功率说了算。此前 source 非空时 FALLBACK_ORDER
-  // 整个被跳过，顺序退化成上游清单的原始次序——那正是运行时日志里兜底跳到
-  // 名单外模型、且 39% 成功率的 deepseek-v4 排在 72% 的 jev 前面的原因。
-  // 不把 FALLBACK_ORDER 并进池子，是因为并入会让候选数越过
-  // test-multilane 的 `每个只试一次` 断言；名单外的模型保持来源顺序垫底。
+  // ⚠️ 这里**不再把 `lane.model` 强制排到第一位**（2026-10-06 改）。
+  // 旧写法是 `const ordered = [lane.model]` 再追加排序结果，于是无论实测如何，
+  // `space-bunny-free` 永远第一个被试。而实测它当时是 0/4 直连（已限流），
+  // 等于**每个请求都先白撞一次墙**再换——这正是「整合处理不动」里被忽略的
+  // 那部分延迟。主车道的顺序应当由实测排名说了算，lane.model 只是池子里的一员。
+  // （非主车道仍然保持「自己那个模型排第一」，见上面的分支。）
   const rank = model => {
     const i = FALLBACK_ORDER.indexOf(model)
     return i < 0 ? FALLBACK_ORDER.length : i
   }
   const source = availableModels.length > 0 ? availableModels : FALLBACK_ORDER
-  const ordered = [lane.model]
-  for (const candidate of [...source].sort((a, b) => rank(a) - rank(b))) {
-    if (!ordered.includes(candidate) && allowed(candidate)) ordered.push(candidate)
+  const pool = new Set()
+  for (const candidate of [lane.model, ...source]) {
+    if (allowed(candidate)) pool.add(candidate)
   }
-  return ordered
+  // 同排名时按名字稳定排序，避免 Set 迭代顺序让每次启动的候选序不同。
+  return [...pool].sort((a, b) => rank(a) - rank(b) || (a < b ? -1 : a > b ? 1 : 0))
+}
+
+/**
+ * 「队列哨兵」模型名 —— 下游点名它，就等于说「你从队列里挑，别问我」。
+ *
+ * ## 为什么必须有这个
+ *
+ * Hindsight 这类调用方**每轮都点名同一个模型**（它只有一个 `LLM_MODEL` 配置项）。
+ * 没有哨兵时，桥必须「尊重点名」——于是队列只在**故障转移**时才生效：
+ * 首选永远是那一个被钉死的模型，它一限流，每轮请求都要先撞它一次才换。
+ * 用户要的「一个用不了就换下一个」就退化成了「每次都要先失败一次」。
+ *
+ * 点名哨兵则把选择权完全交给桥：桥按实测队列取**当前第一个有容量**的，
+ * 被限流的自然跳过，不浪费任何 RTT。
+ *
+ * 用法：`HINDSIGHT_API_LLM_MODEL=free-queue`
+ *
+ * 保留 `auto` / `queue` 作为别名（都是不会被上游当真实模型名的词）。
+ */
+const QUEUE_SENTINELS = new Set(['free-queue', 'auto', 'queue'])
+
+/** 对外推荐的那个哨兵名（`/v1/models` 与文档用它）。 */
+const QUEUE_SENTINEL = 'free-queue'
+
+/**
+ * 下游点名的模型是不是「队列哨兵」。
+ * @param {string} requested
+ * @returns {boolean}
+ */
+export function isQueueSentinel(requested) {
+  return QUEUE_SENTINELS.has(String(requested ?? '').trim().toLowerCase())
 }
 
 /**
  * 算出这一次该用哪条车道的哪个模型。
  *
  * 决策顺序：
- *   1. 下游点名了付费模型 → 拒绝。这条不变，是整个项目的底线。
- *   2. 点名的模型属于某条车道且那辆车道有容量 → 用它。
- *   3. 点名的模型地区受限 → 如实拒绝。
- *   4. 点名的模型是 opencode-only → 降级换档（换模型有用，不该报错）。
- *   5. 否则沿车道顺序找第一条有容量的。
+ *   1. 点名了付费模型 → 拒绝。这条不变，是整个项目的底线。
+ *   2. 点名了队列哨兵（`free-queue`）→ 当作「没点名」，按队列挑第一个有容量的。
+ *   3. 点名的模型属于某条车道且那辆车道有容量 → 用它。
+ *   4. 点名的模型地区受限 → 如实拒绝。
+ *   5. 点名的模型是 opencode-only → 降级换档（换模型有用，不该报错）。
+ *   6. 否则沿队列顺序找第一个有容量的。
  *
  * @param {string} requested 下游点名的模型，空串表示「你自己挑」
  * @param {string[]} available 主车道探测到的可达模型
@@ -591,55 +798,86 @@ export function pickModel(requested, available) {
   const primary = PRIMARY_LANE
   const pool = candidatesFor(primary)
 
+  // 队列哨兵 = 下游主动放弃点名。当成空串走队列，而不是当成模型名去校验。
+  const asked = isQueueSentinel(requested) ? '' : String(requested ?? '').trim()
+
   // 点名了付费模型：如实拒绝。静默改投会让调用方以为自己用的就是点名的那个模型，
   // 而实际跑的完全是另一回事。
   const declaredFreeModel = LANES.some(lane =>
-    (lane.knownFree === true && lane.model === requested) ||
-    (Array.isArray(lane.knownFreeModels) && lane.knownFreeModels.includes(requested)))
-  if (requested !== '' && !isFreeModel(requested) && !declaredFreeModel) {
-    return { error: `model "${requested}" is not a free-lane model; this bridge only serves models whose id ends in "-free"` }
+    (lane.knownFree === true && lane.model === asked) ||
+    (Array.isArray(lane.knownFreeModels) && lane.knownFreeModels.includes(asked)))
+  if (asked !== '' && !isFreeModel(asked) && !declaredFreeModel) {
+    return { error: `model "${asked}" is not a free-lane model; this bridge only serves models whose id ends in "-free"` }
   }
-  if (requested !== '' && KNOWN_REGION_BLOCKED.has(requested)) {
-    return { error: `model "${requested}" is region-blocked from this network egress` }
+  if (asked !== '' && KNOWN_REGION_BLOCKED.has(asked)) {
+    return { error: `model "${asked}" is region-blocked from this network egress` }
   }
-  if (requested !== '' && KNOWN_OPENCODE_ONLY.has(requested)) {
-    const alternative = firstWithCapacity(LANES, requested)
+  if (asked !== '' && KNOWN_OPENCODE_ONLY.has(asked)) {
+    const alternative = firstWithCapacity(LANES, asked)
     if (alternative !== undefined) {
-      log(`routing ${requested} -> ${alternative.lane.name}/${alternative.model} (upstream restricts ${requested} to OpenCode-internal calls)`)
+      log(`routing ${asked} -> ${alternative.lane.name}/${alternative.model} (upstream restricts ${asked} to OpenCode-internal calls)`)
       return alternative
     }
-    return { error: `model "${requested}" is restricted to OpenCode-internal calls, and no alternative free model is available` }
+    return { error: `model "${asked}" is restricted to OpenCode-internal calls, and no alternative free model is available` }
   }
 
   // 点名的模型能对上某条车道，且那辆车道还有容量，就用它。
-  if (requested !== '') {
-    const owning = LANES.find(lane => lane.model === requested || candidatesFor(lane).includes(requested))
-    if (owning !== undefined && !inCooldown(owning, requested)) {
-      return { lane: owning, model: requested }
+  if (asked !== '') {
+    const owning = LANES.find(lane => lane.model === asked || candidatesFor(lane).includes(asked))
+    if (owning !== undefined && !inCooldown(owning, asked)) {
+      return { lane: owning, model: asked }
     }
   }
 
-  const chosen = firstWithCapacity(LANES, requested)
+  const chosen = firstWithCapacity(LANES, asked)
   if (chosen !== undefined) return chosen
   return { error: 'all free lanes are currently rate limited' }
 }
 
 /**
- * 按车道顺序找第一个还有容量的目标。
+ * 全队列的候选目标，按 `QUEUE_ORDER` 统一排序。
  *
- * 先按车主自己的候选找，找不到再在车主之间轮——这样「同车道内换模型」优先于
- * 「换车道」，因为换车道意味着凭据、模型能力、schema 支持都可能不同。
+ * 这是「一个队列」的实现：**先把所有车道的所有免费模型排成一条线**，
+ * 而不是「每条车道各排各的、车道之间再串起来」。区别很实在——旧结构里
+ * kilo 车道会先把它自己那个（思考强制开启、又慢又脆的）`liquid` 打一遍，
+ * 才轮到 zen 车道上真正快的 `nemotron-3.5-lightning`。用户要的是
+ * 「一个用不了就换下一个」，那就必须是**一条线**。
+ *
+ * 同一模型出现在多条车道时，按车道定义顺序取先出现的那条（凭据更明确）。
+ *
+ * @param {object[]} lanes 车道列表
+ * @returns {Array<{lane: object, model: string}>} 已按队列顺序排好的目标
+ */
+function queueTargets(lanes) {
+  const seen = new Set()
+  const targets = []
+  for (const lane of lanes) {
+    for (const model of candidatesFor(lane)) {
+      const key = `${lane.name}:${model}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      targets.push({ lane, model })
+    }
+  }
+  // 稳定排序：同名次时保持车道定义顺序，避免每次启动候选序漂移。
+  return targets
+    .map((target, index) => ({ target, index }))
+    .sort((a, b) =>
+      queueRank(a.target.model) - queueRank(b.target.model) || a.index - b.index)
+    .map(entry => entry.target)
+}
+
+/**
+ * 按队列顺序找第一个还有容量的目标。
  *
  * @param {object[]} lanes 车道列表
  * @param {string} exclude 要跳过的模型（通常是刚失败的那个）
  * @returns {{lane: object, model: string}|undefined}
  */
 function firstWithCapacity(lanes, exclude) {
-  for (const lane of lanes) {
-    for (const model of candidatesFor(lane)) {
-      if (exclude !== '' && model === exclude) continue
-      if (!inCooldown(lane, model)) return { lane, model }
-    }
+  for (const { lane, model } of queueTargets(lanes)) {
+    if (exclude !== '' && model === exclude) continue
+    if (!inCooldown(lane, model)) return { lane, model }
   }
   return undefined
 }
@@ -872,6 +1110,18 @@ function aggregateStream(text) {
 async function complete(lane, model, body, ids) {
   const flat = isResponsesModel(model)
   const payload = { ...body, model }
+
+  // 关思考 —— 按**本次实际要打的模型**决定，不是按下游点名的那个。
+  //
+  // 这是本函数被故障转移反复调用的原因所在：`body` 始终是下游的原始请求，
+  // 而 `model` 每次都是新目标。所以补丁必须在这里算，才能做到
+  // 「nemotron 关思考、liquid 不关」——同一轮请求换目标后自动重新判定。
+  //
+  // 显式传了 reasoning 的调用方优先：桥只补默认，不覆盖意图。
+  if (body.reasoning === undefined) {
+    const patch = thinkingOffPatch(model)
+    if (patch !== undefined) Object.assign(payload, patch)
+  }
 
   // 只有「要求指纹工具」的车道才需要补那四件套。给不需要的车道发它们，
   // 反而会让它以为调用方真的注册了这些工具。
@@ -1108,19 +1358,22 @@ function parseVisited(key) {
 }
 
 /**
- * 按车道顺序找第一个**还没试过**的目标。
+ * 按队列顺序找第一个**还没试过**的目标。
+ *
+ * 与 `firstWithCapacity` 共用同一条 `queueTargets` 队列，所以「首选」和
+ * 「故障转移」看到的是同一个顺序——旧实现里两者用了不同的遍历，于是
+ * 首选挑了一个模型、失败后故障转移又从另一个顺序的头上开始，可能把刚失败的
+ * 那个再试一遍。统一到一条队列就没有这个缝隙了。
  *
  * @param {object[]} lanes 车道列表
  * @param {Set<string>} visited 已试过的 `lane:model`
  * @returns {{lane: object, model: string}|undefined}
  */
 function pickUntried(lanes, visited) {
-  for (const lane of lanes) {
-    for (const model of candidatesFor(lane)) {
-      if (visited.has(`${lane.name}:${model}`)) continue
-      if (inCooldown(lane, model)) continue
-      return { lane, model }
-    }
+  for (const { lane, model } of queueTargets(lanes)) {
+    if (visited.has(`${lane.name}:${model}`)) continue
+    if (inCooldown(lane, model)) continue
+    return { lane, model }
   }
   return undefined
 }
@@ -1212,6 +1465,9 @@ async function handle(req, res) {
       throttled: summary.targets,
       retryInSec: summary.soonestSec,
       uptimeSec: Math.floor(process.uptime()),
+      // 哪些模型会被自动关思考。这是「同样一个模型，快 5 倍还是慢 5 倍」的分水岭，
+      // 必须能从 health 一眼看出来，否则调优时只能靠翻日志。
+      thinkingOffModels: [...THINKING_OFF_MODELS],
     })
     return
   }
@@ -1334,6 +1590,9 @@ function downstreamTurnSeed(req, body) {
  */
 function modelRows() {
   const ids = new Set()
+  // 队列哨兵排第一：它是**推荐**的用法（让桥按实测队列挑，而不是钉死一个模型）。
+  // 不列出来，调用方根本不知道有这条路，于是继续钉死单个模型、继续每次先撞限流。
+  ids.add(QUEUE_SENTINEL)
   for (const lane of LANES) {
     if (isFreeModel(lane.model) && !KNOWN_REGION_BLOCKED.has(lane.model)) ids.add(lane.model)
     for (const model of candidatesFor(lane)) ids.add(model)
