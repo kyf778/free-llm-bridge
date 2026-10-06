@@ -613,7 +613,7 @@ free-llm-bridge/
 | **方案 A：桥容器化进 NAS compose** | ✅ `free-llm-bridge` 独立容器、无端口发布、`restart: unless-stopped`；BASE_URL 改服务名直连；桥稳定 2h+，LLM 验证 7 次全过 `base_url=http://free-llm-bridge:18999/v1` |
 | 实战排掉的坑① `thinking` 字段致 400 | ✅ EXTRA_BODY 改 `{"max_tokens":4096}`（对照实验实锤） |
 | 实战排掉的坑② 300s 看门狗 vs 慢机器 | ✅ 加 `STARTUP_WAIT_SECONDS=900`（日志原文给的改法） |
-| 实战排掉的坑③ **pg0 启动死循环** | ✅ **根治：显式 `HINDSIGHT_API_DATABASE_URL=pg0://hindsight`**。四轮排查（磁盘/OOM 全排除，postgres 日志证明每轮 ready 而 pg0 `start()` 返回 None）定性为包装层返回值 bug；老办法（docker restart / 删 pid）**实测证伪**，已从 FAQ 撤下 |
+| 实战排掉的坑③ **pg0 启动死循环** | ⚠️ **此前结论已更正**。曾记为「显式 `HINDSIGHT_API_DATABASE_URL=pg0://hindsight` 一行根治」——**该结论不成立**：`pg0://` 走的正是那条会返回 `None` 的代码路径。2026-10-06 复测后确认正确形态是**显式 `postgresql://` + 入口包装脚本**（`deploy/start-hindsight.sh`，负责启动 postgres 并轮询到 running:true 再交给官方入口）。两者必须成对，缺一会踩另一个坑，详见 setup 文档排错 FAQ 第一条 |
 
 剩余：智谱第二车道（可选）、GitHub 发布（需用户账号授权）。
 
@@ -650,4 +650,106 @@ ALL CHECKS PASSED — 零成本链路已打通
    换成即时备份。
 2. **发布到 GitHub**：见 `docs/publish-to-github.md`，需要你的账号授权。
 
-（原第 3 条「pg0 复发风险」已解决：显式 `pg0://hindsight` 一行根治，处置说明进了排错 FAQ。）
+（原第 3 条「pg0 复发风险」的处置说明已更正并进了排错 FAQ：正确形态是
+显式 `postgresql://` + `deploy/start-hindsight.sh` 入口包装**成对使用**，
+不是此前记的「`pg0://hindsight` 一行根治」。）
+
+---
+
+## 十四、2026-10-06 第二轮：请求构造 6 处缺陷 + Kilo 第二免密车道
+
+### 背景：一次「上游变了」的误判
+
+Hindsight 的 LLM 成功率从 10-05 的 98.8% 掉到 10-06 的 14%
+（477 次里 409 次失败），现象是上游对桥的每次补全请求回
+`403 only be used from within OpenCode` 或 `500 Internal server error`。
+
+对照实验把它定性为**桥自己的问题**，不是上游改政策：
+
+| 对照 | 结果 |
+| --- | --- |
+| DSH 插件（同机、同出口）跑 `nemotron-3.5-lightning-free` | ✅ 200 |
+| 桥请求同一模型 | ❌ 403 / 500 |
+| 桥换 JP 出口（本机验证过 preload 生效） | ❌ 仍然 403 / 500 |
+
+两边 UA、`x-opencode-*`、`authorization: Bearer public`、`accept`、
+工具指纹四件套、端点**逐项核对完全一致**——所以差异只能在实现细节里。
+
+### 根因：6 处请求构造缺陷
+
+| # | 位置 | 缺陷 | 后果 |
+| --- | --- | --- | --- |
+| 1 | `gatewayHeaders(lane, ids, stream)` | 签名收 2 参、调用点传 3 参 | `stream` 永远是 `undefined` → `accept` **从未**变成 `text/event-stream` |
+| 2 | `complete()` | 注入四件套时没配 `tool_choice: 'none'` | 过不了上游的指纹门 |
+| 3 | `worthFailoverTo()` | 清单里没有上游 5xx | 一回 500 就放弃，**不换下一个模型** |
+| 4 | `complete()` 空完成分支 | 直接 `return`，没调用 `failover()` | 链停在一个只吐思考、没有正文的模型上 |
+| 5 | `candidatesFor()` | 非主车道只认 `lane.model` 一个候选 | Kilo 的 17 个免费模型只能点到 1 个 |
+| 6 | `gatewayHeaders()` | 给**所有**无 `apiKey` 的车道加 `Bearer public` | 那是 OpenCode 的凭据；Kilo 收到回 `401 INVALID_TOKEN` |
+
+第 3、4 条是同一类 bug 的两半：`worthFailoverTo()` 认为某种失败"值得换目标"，
+而调用点压根没调它——**声明与实现不一致**，README 里"一个不行就换下一个"
+在这两种最常见的失败模式下是不生效的。
+
+### 那道 403 门的钥匙就是 `accept: text/event-stream`
+
+A/B 实测（同一请求体，只改这一个头）：
+
+```
+stream:true  + accept: text/event-stream  →  200
+stream:false + accept: */*                →  403 only be used from within OpenCode
+```
+
+而缺陷 1 让 `accept` 永远是 `*/*`，所以**修好它之前，桥对每个模型都吃 403**。
+更深一层：**Hindsight 发的是非流式请求**，即使修好缺陷 1，非流式调用依然拿不到
+这个头。所以还要让桥对这类车道**一律用流式去取上游、再在本地用 `aggregateStream()`
+把 SSE 合成回 JSON**——这是缺陷 1 的完整修法。
+
+### 新增能力：多候选车道字段
+
+| 字段 | 作用 |
+| --- | --- |
+| `knownFree: true` | 声明 `model` 免费，即使 id 不以 `-free` 结尾（智谱 `glm-4-flash-250414`、Kilo 的 `org/model:free`） |
+| `knownFreeModels: [...]` | 一条车道声明**一组**已知免费 id |
+| `keyless: true` | 这条车道**不需要任何凭据**，连 `Bearer public` 也不发 |
+
+`keyless` 不是装饰：OpenCode 用 `Bearer public` 表示"免密"，而 Kilo 把无效凭据
+当成登录失败回 401。**"不需要认证"必须能显式声明，靠"没填 apiKey"推断是错的。**
+
+### 第二条免密车道：Kilo AI
+
+`https://api.kilo.ai/api/gateway`，401 个模型里 17 个 `isFree: true`，
+**完全不需要 key**。按 Hindsight 的真实请求形态（非流式 + `json_schema` + 8192 tokens）
+跑了 3 轮稳定性测试，取中位延迟排序：
+
+| 模型 | 中位延迟 | 3 轮稳定性 |
+| --- | --- | --- |
+| `liquid/lfm-2.5-2.6b:free` | 5.5s | 3/3 |
+| `nvidia/nemotron-3-super-120b-a12b:free` | 6.7s | 3/3 |
+| `kilo-auto/free` | 7.6s | 3/3 |
+| `cohere/north-mini-code:free` | 7.7s | 3/3 |
+| `dots-studio/dots-3-note-preview:free` | 8.6s | 3/3 |
+| `poolside/laguna-s-2.1:free` | 8.8s | 1/3（会 429，垫底） |
+
+排除的候选（都有实测证据）：`stepfun/step-3.7-flash:free`（输出被思维链占满）、
+`nvidia/nemotron-3-nano-omni-*`（3 轮全空）、`apodex/*` 与 `inclusionai/ling-3.0-sante`
+（**400，不接受 json_schema**）、`laguna-xs-2.1`（429）。
+
+### 顺带更正一处旧结论
+
+桥里硬编码的 `KNOWN_OPENCODE_ONLY` 黑名单（`longcat`、`nemotron-3-ultra`、
+`nemotron-3.5-lightning`、`fledge`）曾被判定"已过期"。**实测证明那个判定是错的**：
+在缺陷 1/2 修好之前，这四个确实一律 403。修好请求形状后它们才放行，
+所以清空黑名单是修复的**结果**，不是原因。
+
+### 验收
+
+```
+longcat-2.5-preview-free   → 200 + 真内容
+fledge-alpha-free          → 200 + 真内容
+nemotron-3.5-lightning     → 200（流式）
+点名坏的 space-bunny        → 自动换到 longcat 并 200
+Hindsight 真实请求形态      → 200, {"facts":["Pong"]}
+```
+
+三套离线断言 `ALL CHECKS PASSED`；Hindsight 端今日成功数从 68 涨到 119，
+`last_memory_write_at` 恢复推进。

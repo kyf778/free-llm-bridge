@@ -9,5 +9,11 @@ node_modules/
 
 # 临时 commit message 文件
 MSGTMP.md
+MSGTMP.txt
 scripts/commitmsg.txt
 docs/commitmsg.txt
+
+# 改 index.js 前留的本地备份（排查时方便回滚，不进仓库）
+index.js.bak-*
+*.bak-[0-9]*
+docker-compose.yml.bak-*

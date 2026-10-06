@@ -62,13 +62,50 @@ node index.js
 | `name` | ✅ | 出现在日志与 `/health` 里 |
 | `baseUrl` | ✅ | 到 `/chat/completions` 的前缀 |
 | `model` | ✅ | **必须是确认免费的那一档**。填错付费模型名 = 静默把账单接回去 |
-| `apiKey` | | 不填则用 `Bearer public` |
+| `apiKey` | | 不填则用 `Bearer public`（那是 OpenCode 免密车道的凭据） |
+| `keyless` | | `true` 表示**这条车道不需要任何凭据**，连 `Bearer public` 也不发 |
 | `headers` | | 该家要求的额外请求头 |
+| `knownFree` | | 声明 `model` 是免费档，即使 id 不以 `-free` 结尾 |
+| `knownFreeModels` | | 一组已知免费 id，让车道能声明**多个**候选（见下面的 Kilo 例子） |
 | `sessionScoped` | | true 才发 `x-opencode-session`（按 session 计额的才需要） |
 | `fingerprintTools` | | true 才补 `bash/glob/grep/read` 四件套 |
 | `strictSchema` | | true 才发 `response_format`（不支持的会 400） |
 | `normalizeSchema` | | true 才剥掉 nullable 联合类型 |
 | `pathStyle` | | `"openai"` 表示标准 `/chat/completions`；省略则按模型分流 |
+
+### 第二条免密车道：Kilo AI
+
+除了 OpenCode Zen，**Kilo AI 也是一条完全不需要 key 的车道**，免费池里有 17 个模型
+（`isFree: true`）。它的 id 形如 `org/model:free`，不以 `-free` 结尾，所以要用
+`knownFreeModels` 显式声明：
+
+```bash
+export LANES='[
+  {"name":"zen","baseUrl":"https://opencode.ai","model":"space-bunny-free",
+   "headers":{"user-agent":"opencode/1.18.31","x-opencode-client":"desktop"},
+   "fingerprintTools":true,"sessionScoped":true,"normalizeSchema":true,"strictSchema":true},
+  {"name":"kilo","baseUrl":"https://api.kilo.ai/api/gateway",
+   "model":"liquid/lfm-2.5-2.6b:free",
+   "knownFree":true,"keyless":true,"pathStyle":"openai",
+   "knownFreeModels":[
+     "liquid/lfm-2.5-2.6b:free",
+     "nvidia/nemotron-3-super-120b-a12b:free",
+     "kilo-auto/free",
+     "cohere/north-mini-code:free",
+     "dots-studio/dots-3-note-preview:free",
+     "poolside/laguna-s-2.1:free"
+   ]}
+]'
+```
+
+> ⚠️ `keyless` 不是可选的装饰：**OpenCode 用 `Bearer public` 表示"免密"，
+> 但把同一个头发给 Kilo 会得到 `401 INVALID_TOKEN`**——上游把无效凭据当成登录失败。
+> 一条车道若真的不需要认证，必须显式声明，光靠"没填 apiKey"推断是不够的。
+>
+> 名单里那 6 个已按实测中位延迟排序（5.5s → 8.8s）。Kilo 免费池里还有
+> `stepfun/step-3.7-flash:free` 等，但实测**输出被思维链占满或不接受 json_schema**，
+> 对 Hindsight 这种要结构化 JSON 的调用不合适，故未列入。
+
 
 `/health` 逐条报出每辆车道还有没有容量：
 
@@ -78,7 +115,23 @@ curl -s localhost:18999/health | jq '.lanes'
 
 故障转移顺序：**先在同一条车道内换模型**（凭据、能力、schema 策略都不变），
 **换不动了再换车道**。每个 `lane:model` 最多被打一次，总跳数有上限，不会打转。
-触发条件：限流 429、凭据失效 401/403、传输层连不上、以及 opencode-only 403。
+
+触发换目标的失败类型（2026-10-06 补齐，此前有漏项导致"一个不行就换下一个"在最常见的
+失败模式下**不生效**）：
+
+| 失败 | 是否换目标 | 说明 |
+| --- | --- | --- |
+| 429 限流 | ✅ | 冷却时长取上游 `retry-after`，封顶 6 小时 |
+| 传输层失败 | ✅ | DNS/连接被拒/超时 |
+| 凭据失效 401/403 | ✅ | 换车道才有用 |
+| `403 opencode-only` | ✅ | 该模型只对 OpenCode 内部开放 |
+| **上游 5xx** | ✅ | **曾漏判**：上游回 500 时桥直接放弃、不换下一个 |
+| **空完成** | ✅ | **曾漏判**：200 但正文为空（静默失败）也会停下不换 |
+| 地区门 403 | ❌ | 换目标解决不了，如实上报 |
+
+上面两个"曾漏判"是同一类 bug：`worthFailoverTo()` 的清单里没有它们，
+而调用点又直接 `return`，于是链会停在一个明显该跳过的目标上。
+
 
 ---
 
@@ -230,9 +283,23 @@ environment:
   HINDSIGHT_API_LLM_BASE_URL: http://free-llm-bridge:18999/v1
   HINDSIGHT_API_LLM_API_KEY: local
   HINDSIGHT_API_LLM_MODEL: space-bunny-free
-  # ⚠️ 必须显式写——缺了它会踩内嵌 pg0 的启动死循环（详见 setup 文档排错 FAQ 第一条）
-  HINDSIGHT_API_DATABASE_URL: pg0://hindsight
+  # ⚠️ 必须显式写成 postgresql://，并配下面的 entrypoint 包装脚本。
+  # 这两件事必须成对出现，缺一不可——原因见 setup 文档排错 FAQ 第一条。
+  HINDSIGHT_API_DATABASE_URL: postgresql://hindsight:hindsight@127.0.0.1:5432/hindsight
 ```
+
+内嵌 postgres 必须**有人明确负责启动**，所以 Hindsight 服务还要加一个入口包装：
+
+```yaml
+  entrypoint: ["/bin/bash", "/app/start-hindsight.sh"]
+  volumes:
+    - hindsight-data:/home/hindsight/.pg0
+    - ./start-hindsight.sh:/app/start-hindsight.sh:ro   # 来自本仓库 deploy/
+```
+
+脚本见 [`deploy/start-hindsight.sh`](deploy/start-hindsight.sh)：它启动 postgres、轮询到
+真的 `running: true` 再把控制权交给官方入口。**两个都配**才是稳定形态；
+只配 `pg0://` 或在别处启动 postgres，都会在容器重建后进入启动死循环。
 
 桥也可以跑在自己电脑上（双击 `启动桥.cmd`），但那是备选：要开窗口、要配防火墙、
 电脑关机记忆就停。跨机器时 `host.docker.internal` 是**错的**——它指向 Hindsight

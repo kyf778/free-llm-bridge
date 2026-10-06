@@ -429,15 +429,30 @@ asyncTest('部署文档的 BASE_URL 与实际拓扑一致（桥容器化 = compo
     `containerized deploy expects the compose service name, got ${baseUrl[1]}`)
 })
 
-asyncTest('部署文档包含 pg0 显式 URL（缺了它容器会陷入启动死循环）', async () => {
-  // 实测教训：不写 HINDSIGHT_API_DATABASE_URL 时，pg0 start() 返回值 bug 导致
-  // `PostgreSQL started: None → ValueError → 重启循环`（7 轮日志证据）。
-  // 这行配置是根治手段，文档样例里丢了它 = 新用户必然踩坑。
+asyncTest('部署文档给出「显式 postgresql:// + 入口包装」这一对（缺一会踩启动死循环）', async () => {
+  // 2026-10-06 复测更正。此前这条断言要求文档写 `pg0://hindsight`，理由是
+  // 「不写就踩 pg0 start() 返回值 bug」——那个结论不成立：`pg0://` 走的**正是**
+  // 会返回 None 的代码路径（resolve_database_url 的 is_pg0 分支 →
+  // EmbeddedPostgres.ensure_running() → start() → info.uri）。
+  //
+  // 实测出来的稳定形态是两件事配对：
+  //   ① 显式 postgresql:// —— 让 Hindsight 完全绕开不可靠的 pg0 探测；
+  //   ② 入口包装 start-hindsight.sh —— 因为绕开之后就没有任何人启动 postgres 了
+  //      （只配 ① 会在容器重建后 Connection refused）。
+  // 少任何一半，新用户都会踩坑，所以两半都要在样例里。
   const setup = await readFile(new URL('./docs/hindsight-setup.md', import.meta.url), 'utf8')
   const envBlock = setup.match(/### 改之后（零成本）[\s\S]*?```yaml\n([\s\S]*?)```/)
   assert.ok(envBlock !== null, 'setup doc should have a "改之后" yaml block')
-  assert.match(envBlock[1], /HINDSIGHT_API_DATABASE_URL:\s*pg0:\/\/hindsight/,
-    'the deploy block must include the explicit pg0 DATABASE_URL')
+  assert.match(envBlock[1], /HINDSIGHT_API_DATABASE_URL:\s*postgresql:\/\/[^\s]*@127\.0\.0\.1:5432\//,
+    'the deploy block must set an explicit postgresql:// DATABASE_URL')
+  assert.match(envBlock[1], /entrypoint:.*start-hindsight\.sh/,
+    'the deploy block must wire the start-hindsight.sh entrypoint (nothing else starts postgres)')
+  assert.doesNotMatch(envBlock[1], /HINDSIGHT_API_DATABASE_URL:\s*pg0:\/\//,
+    'pg0:// is the disproven form — it still calls start() and reads the None uri')
+  // 包装脚本本身必须随仓库发布，否则文档里的挂载路径指向空气。
+  const wrapper = await readFile(new URL('./deploy/start-hindsight.sh', import.meta.url), 'utf8')
+  assert.match(wrapper, /pg0.*info.*--name hindsight/s, 'wrapper must poll pg0 info for readiness')
+  assert.match(wrapper, /exec \/app\/start-all\.sh/, 'wrapper must hand off to the official entrypoint')
 })
 
 asyncTest('部署文档明确区分了「同一台机器」与「不同机器」两种拓扑', async () => {

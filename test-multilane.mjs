@@ -253,8 +253,12 @@ try {
 
   // --- 剧本 3：整条主车道全挂 -> 换备用车道 --------------------------------
   process.stdout.write('\n[3] 主车道所有模型都限流 -> 换备用车道\n')
-  for (const m of ['primary-model-free', 'space-bunny-free', 'mimo-v2.6-flash-free',
-    'deepseek-v4-flash-free', 'ling-3.0-flash-fin-free', 'ling-3.1-flash-free', 'mimo-v2.5-free']) {
+  // 这份名单必须与 FALLBACK_ORDER 的**全部**成员同步（外加点名的 primary-model-free）：
+  // 少一个，那个没被脚本化的模型就会以默认 200 成功，把「主车道穷尽 -> 换车道」
+  // 的剧本打断在半路——备用车道一次都不会被问到。（2026-10-05 加入 jev-1.13-free 时踩过）
+  for (const m of ['primary-model-free', 'space-bunny-free', 'jev-1.13-free',
+    'mimo-v2.6-flash-free', 'deepseek-v4-flash-free', 'ling-3.0-flash-fin-free',
+    'ling-3.1-flash-free', 'mimo-v2.5-free']) {
     PRIMARY_MODEL_SCRIPTS.set(m, '429')
   }
   const pBefore2 = primarySaw.requests.length
@@ -263,8 +267,11 @@ try {
   check('调用方拿到 200', r2.status === 200, `got ${r2.status} ${JSON.stringify(r2.body?.error ?? '')}`)
   check('由备用车道服务', r2.body?.model === 'backup-model-free', r2.body?.model)
   check('指纹如实标出备用车道', r2.body?.system_fingerprint === 'free-llm-bridge/backup')
+  // 候选数 = 车道自己的 primary-model-free + FALLBACK_ORDER 全部 7 个 = 8。
+  // 断言的本意是「每个候选只试一次、不打转」，上限随候选池同步；数字本身不重要，
+  // 重要的是它等于候选数而不是更大（打转会让它超过候选数）。
   check('主车道候选每个只试一次（不打转）',
-    (primarySaw.requests.length - pBefore2) <= 7, `${primarySaw.requests.length - pBefore2} primary call(s)`)
+    (primarySaw.requests.length - pBefore2) <= 8, `${primarySaw.requests.length - pBefore2} primary call(s)`)
   check('备用车道只被问了一次', (backupSaw.requests.length - bBefore2) === 1, ` ${backupSaw.requests.length - bBefore2} backup call(s)`)
 
   // 备用车道真的被调用过了，现在才有意义检查它收到的请求形状。
@@ -279,8 +286,8 @@ try {
   check('备用车道收到了调用方的原始模型名', backupBody.model === 'backup-model-free', backupBody.model)
 
   // 恢复：只让点名的那一个挂，其余候选恢复可用
-  for (const m of ['space-bunny-free', 'mimo-v2.6-flash-free', 'deepseek-v4-flash-free',
-    'ling-3.0-flash-fin-free', 'ling-3.1-flash-free', 'mimo-v2.5-free']) {
+  for (const m of ['space-bunny-free', 'jev-1.13-free', 'mimo-v2.6-flash-free',
+    'deepseek-v4-flash-free', 'ling-3.0-flash-fin-free', 'ling-3.1-flash-free', 'mimo-v2.5-free']) {
     PRIMARY_MODEL_SCRIPTS.delete(m)
   }
 

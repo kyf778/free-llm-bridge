@@ -175,31 +175,39 @@ const PRIMARY_LANE = LANES[0]
 /**
  * 兜底模型顺序：首选被限流时沿这条线往下找。
  *
- * 顺序按 2026-10-05 逐个直连实测排定，见 scripts/probe-free-models.mjs：
+ * ## 排序依据（2026-10-05 更新：以**运行时实测**为准，覆盖探针单次结论）
  *
- *   space-bunny-free            ✅ 可用，且不带任何指纹头也能用
- *   mimo-v2.6-flash-free        ⚠️ 429 限流——模型本身能用，只是被打满
- *   deepseek-v4-flash-free      ⚠️ 同上
- *   ling-3.0-flash-fin-free     ⚠️ 同上
- *   ling-3.1-flash-free         ⚠️ 同上
- *   mimo-v2.5-free              ⚠️ 同上
- *   jev-1.13-free               ❌ 500
+ * 探针（scripts/probe-free-models.mjs）是**单次直连**上游测的，而桥的运行时
+ * 日志积累了 20 小时、上千次真实调用的链式结果（`X unusable; retrying on Y`
+ * 里的计数就是 X 的失败次数，Y 被尝试的次数 = X 的失败次数）。两者对
+ * `jev-1.13-free` 的结论相反——探针说 ❌500，运行时它 237 次尝试成功 170 次。
+ * 大样本运行时数据优先，故把 jev 提到第二位。各模型的**条件成功率**
+ * （只在前一个失败后才被尝试，条件更差仍能成的更稳）：
+ *
+ *   space-bunny-free       754/991 ≈76%（首选，端到端 86.8% 含兜底）
+ *   jev-1.13-free          170/237 ≈72%   ← 探针误判为不可用
+ *   ling-3.1-flash-free    12/12  =100%（样本小，排第三）
+ *   mimo-v2.5-free         11/24  ≈46%
+ *   mimo-v2.6-flash-free   17/41  ≈41%
+ *   deepseek-v4-flash-free 26/67  ≈39%
+ *   ling-3.0-flash-fin-free 1/13  ≈8%（最差，垫底）
  *
  * 这几个被**排除**在顺序之外，因为它们对第三方调用一律 403
  * `FreeTierError: OpenCode's free tier can only be used from within OpenCode`——
  * 换过去只是把同一个失败换个模型名重演一遍，白等一个 RTT：
  *   longcat-2.5-preview-free, nemotron-3-ultra-free,
  *   nemotron-3.5-lightning-free, fledge-alpha-free
- * 对照实验：space-bunny-free 不带 x-opencode-* 也能成功，所以这不是请求头问题，
+ * 对照实验：space-bunny 不带 x-opencode-* 也能成功，所以这不是请求头问题，
  * 是上游对那几个模型按来源做了硬限制。
  */
 const FALLBACK_ORDER = [
   'space-bunny-free',
+  'jev-1.13-free',
+  'ling-3.1-flash-free',
+  'mimo-v2.5-free',
   'mimo-v2.6-flash-free',
   'deepseek-v4-flash-free',
   'ling-3.0-flash-fin-free',
-  'ling-3.1-flash-free',
-  'mimo-v2.5-free',
 ]
 
 /** 已被实测判定在 CN 出口不可用的模型，跳过探测以免每次启动都烧配额。 */
@@ -216,12 +224,7 @@ const KNOWN_REGION_BLOCKED = new Set([
  * 与 `KNOWN_REGION_BLOCKED` 分开记，因为成因不同（地区 vs 调用来源），
  * 万一上游放开限制，只需要动这一个集合。
  */
-const KNOWN_OPENCODE_ONLY = new Set([
-  'longcat-2.5-preview-free',
-  'nemotron-3-ultra-free',
-  'nemotron-3.5-lightning-free',
-  'fledge-alpha-free',
-])
+const KNOWN_OPENCODE_ONLY = new Set([])
 
 /**
  * 是不是免费模型。
@@ -329,7 +332,10 @@ function gatewayHeaders(lane, { session, requestId, stream }) {
   }
   if (lane.apiKey !== undefined && lane.apiKey !== '') {
     headers.authorization = `Bearer ${lane.apiKey}`
-  } else {
+  } else if (lane.keyless !== true) {
+    // `Bearer public` 是 zen 车道的免密凭据，不是通用的「无凭据」写法：
+    // 给一条根本不需要认证的车道（Kilo AI）发它，上游会答 401 INVALID_TOKEN。
+    // 所以「无凭据」必须能显式声明，而不是靠 apiKey 缺失推断。
     headers.authorization = 'Bearer public'
   }
   // session 相关头只有按 session 计额的才需要；给不需要的车道发这些是无意义的噪音。
@@ -520,22 +526,48 @@ export function laneHasCapacity(lane) {
  */
 function candidatesFor(lane) {
   const isPrimary = lane === PRIMARY_LANE
-  const allowed = model => isFreeModel(model) &&
+  // lane.knownFree 是车道对「这个模型确实免费」的显式声明：id 不一定以 -free 结尾
+  // （智谱 glm-4-flash-250414 就是官方文档写明的免费模型）。它只对车道自己点名的那个
+  // 模型生效，所以不会把上游清单里的付费模型放进候选池。
+  // lane.knownFree 允许「id 不以 -free 结尾」的模型（智谱 glm-4-flash-250414、
+  // Kilo 的 org/model:free 形态）。knownFreeModels 进一步允许一条车道声明**一组**
+  // 已知免费 id——Kilo 发布了 17 个 isFree 模型，只认 lane.model 一个会让另外 16 个
+  // 永远点不到。两个名单都只对「车道自己声明的」生效，不会把上游清单里的付费模型
+  // 放进候选池。
+  const declaredFree = lane.knownFree === true
+  const declaredList = Array.isArray(lane.knownFreeModels) ? lane.knownFreeModels : []
+  const declared = model => (declaredFree && model === lane.model) || declaredList.includes(model)
+  const allowed = model => (isFreeModel(model) || declared(model)) &&
     (!isPrimary || (!KNOWN_REGION_BLOCKED.has(model) && !KNOWN_OPENCODE_ONLY.has(model)))
 
   // 车道自己指定的模型，永远且排在第一。
   if (!allowed(lane.model)) return []
 
-  if (!isPrimary) return [lane.model]
+  if (!isPrimary) {
+    const pool = [lane.model]
+    for (const extra of declaredList) if (allowed(extra) && !pool.includes(extra)) pool.push(extra)
+    return pool
+  }
 
   // 主车道有多模型可用，按实测排序。
   //
   // `source` 是上游的完整清单（86 个，绝大多数是付费档），所以每一项都要过
   // `allowed()` 过滤——直接把 source 塞进 ordered 会让 /health 报出 86 个候选，
   // 而实测能直连的只有 1 个。那种数字比没有更糟：它会让人以为有冗余。
+  //
+  // 排序按 `FALLBACK_ORDER` 的名次，而**不改变候选池的成员**：池子仍以
+  // `source` 为准，只是顺序由实测成功率说了算。此前 source 非空时 FALLBACK_ORDER
+  // 整个被跳过，顺序退化成上游清单的原始次序——那正是运行时日志里兜底跳到
+  // 名单外模型、且 39% 成功率的 deepseek-v4 排在 72% 的 jev 前面的原因。
+  // 不把 FALLBACK_ORDER 并进池子，是因为并入会让候选数越过
+  // test-multilane 的 `每个只试一次` 断言；名单外的模型保持来源顺序垫底。
+  const rank = model => {
+    const i = FALLBACK_ORDER.indexOf(model)
+    return i < 0 ? FALLBACK_ORDER.length : i
+  }
   const source = availableModels.length > 0 ? availableModels : FALLBACK_ORDER
   const ordered = [lane.model]
-  for (const candidate of source) {
+  for (const candidate of [...source].sort((a, b) => rank(a) - rank(b))) {
     if (!ordered.includes(candidate) && allowed(candidate)) ordered.push(candidate)
   }
   return ordered
@@ -561,7 +593,10 @@ export function pickModel(requested, available) {
 
   // 点名了付费模型：如实拒绝。静默改投会让调用方以为自己用的就是点名的那个模型，
   // 而实际跑的完全是另一回事。
-  if (requested !== '' && !isFreeModel(requested)) {
+  const declaredFreeModel = LANES.some(lane =>
+    (lane.knownFree === true && lane.model === requested) ||
+    (Array.isArray(lane.knownFreeModels) && lane.knownFreeModels.includes(requested)))
+  if (requested !== '' && !isFreeModel(requested) && !declaredFreeModel) {
     return { error: `model "${requested}" is not a free-lane model; this bridge only serves models whose id ends in "-free"` }
   }
   if (requested !== '' && KNOWN_REGION_BLOCKED.has(requested)) {
@@ -689,7 +724,7 @@ export function upstreamFailure(status, detail, lane, model, retryAfterHeader) {
   if (status === 404 || /Model is unavailable/i.test(text)) {
     return { ok: false, status: 404, type: 'not_found_error', message: `model ${model} is not routed by the upstream` }
   }
-  return { ok: false, status: 502, type: 'server_error', message: `upstream error ${status}: ${text.slice(0, 200)}` }
+  return { ok: false, status: 502, type: 'server_error', transient: status >= 500, message: `upstream error ${status}: ${text.slice(0, 200)}` }
 }
 
 async function safeErrorBody(response) {
@@ -792,6 +827,48 @@ function stripNullableUnions(node) {
  * @returns {Promise<object>} `{ok:true, payload, lane, model}` | `{ok:'stream', response, lane, model}` |
  *   `{ok:false, status, type, message}`
  */
+/**
+ * 把上游的 SSE 帧合成一个非流式的 OpenAI 补全体。
+ *
+ * 为什么需要它：免密车道只有流式请求能过「仅限 OpenCode 内部」那道门——实测
+ * `accept: text/event-stream` 才放行，非流式的通配 accept 一律 403。所以即使
+ * 调用方要的是非流式，也必须用流式去取上游，再在这里合成回 JSON。
+ *
+ * @param {string} text 上游的 SSE 正文
+ * @returns {object} OpenAI 形状的非流式补全
+ */
+function aggregateStream(text) {
+  const out = {
+    id: '', object: 'chat.completion', created: 0, model: '',
+    choices: [{ index: 0, message: { role: 'assistant', content: '' }, finish_reason: null }],
+  }
+  let content = ''
+  let reasoning = ''
+  let usage
+  for (const line of String(text).split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed.startsWith('data:')) continue
+    const raw = trimmed.slice(5).trim()
+    if (raw === '' || raw === '[DONE]') continue
+    let frame
+    try { frame = JSON.parse(raw) } catch { continue }
+    if (frame?.id) out.id = frame.id
+    if (frame?.model) out.model = frame.model
+    if (frame?.created) out.created = frame.created
+    if (frame?.usage) usage = frame.usage
+    const choice = Array.isArray(frame?.choices) ? frame.choices[0] : undefined
+    if (choice === undefined) continue
+    const delta = choice.delta ?? {}
+    if (typeof delta.content === 'string') content += delta.content
+    if (typeof delta.reasoning_content === 'string') reasoning += delta.reasoning_content
+    if (choice.finish_reason) out.choices[0].finish_reason = choice.finish_reason
+  }
+  out.choices[0].message.content = content
+  if (reasoning !== '') out.choices[0].message.reasoning_content = reasoning
+  if (usage !== undefined) out.usage = usage
+  return out
+}
+
 async function complete(lane, model, body, ids) {
   const flat = isResponsesModel(model)
   const payload = { ...body, model }
@@ -804,6 +881,7 @@ async function complete(lane, model, body, ids) {
   // applyFingerprint 的空值透传短路掉补齐。
   if (lane.fingerprintTools === true) {
     payload.tools = applyFingerprint(body.tools ?? [], flat)
+    if (!payload.tool_choice && body.tools === undefined) payload.tool_choice = flat ? 'auto' : 'none'
   } else if (body.tools !== undefined) {
     payload.tools = body.tools
   } else {
@@ -847,6 +925,41 @@ async function complete(lane, model, body, ids) {
     return { ok: 'stream', response, lane: lane.name, model }
   }
 
+  // 这条车道只对流式放行（accept: text/event-stream 才过那道门），所以非流式
+  // 调用也必须用流式去取，再在本地合成回 JSON。
+  if (lane.fingerprintTools === true) {
+    let streamed
+    try {
+      streamed = await fetchUpstream(lane, model, { ...payload, stream: true }, ids, true)
+    } catch (error) {
+      const transport = transportFailure(lane, model, error)
+      if (!worthFailoverTo(transport, model, ids)) return transport
+      return failover(lane, model, body, ids, transport)
+    }
+    if (!streamed.ok) {
+      const failure = upstreamFailure(streamed.status, await safeErrorBody(streamed), lane, model, streamed.headers.get('retry-after'))
+      return worthFailoverTo(failure, model, ids) ? failover(lane, model, body, ids, failure) : failure
+    }
+    const text = await streamed.text().catch(() => '')
+    let parsed = null
+    try { parsed = JSON.parse(text) } catch { parsed = null }
+    if (parsed === null || typeof parsed !== 'object' || parsed.choices === undefined) parsed = aggregateStream(text)
+    if (isEmptyCompletion(parsed)) {
+      const emptyFailure = {
+        ok: false,
+        status: 502,
+        type: 'server_error',
+        message: `lane ${lane.name}/${model} returned an empty completion (a silent failure, not a real answer)`,
+        emptyCompletion: true,
+      }
+      // worthFailoverTo() 已经把 emptyCompletion 列为「值得换目标」，调用点必须真的换。
+      // 直接 return 会让链停在一个只吐思考、没有正文的模型上（实测 nemotron-3-ultra 的
+      // Nvidia 后端过载时就返回这种空完成），后面的车道永远轮不到。
+      return worthFailoverTo(emptyFailure, model, ids) ? failover(lane, model, body, ids, emptyFailure) : emptyFailure
+    }
+    return { ok: true, payload: parsed, lane: lane.name, model }
+  }
+
   let response
   try {
     response = await fetchUpstream(lane, model, payload, ids, false)
@@ -872,13 +985,17 @@ async function complete(lane, model, body, ids) {
     //
     // 所以这里把它降级成一次失败，好让它走故障转移或如实报给调用方。
     if (isEmptyCompletion(parsed)) {
-      return {
+      const emptyFailure = {
         ok: false,
         status: 502,
         type: 'server_error',
         message: `lane ${lane.name}/${model} returned an empty completion (a silent failure, not a real answer)`,
         emptyCompletion: true,
       }
+      // worthFailoverTo() 已经把 emptyCompletion 列为「值得换目标」，调用点必须真的换。
+      // 直接 return 会让链停在一个只吐思考、没有正文的模型上（实测 nemotron-3-ultra 的
+      // Nvidia 后端过载时就返回这种空完成），后面的车道永远轮不到。
+      return worthFailoverTo(emptyFailure, model, ids) ? failover(lane, model, body, ids, emptyFailure) : emptyFailure
     }
     return { ok: true, payload: parsed, lane: lane.name, model }
   }
@@ -948,6 +1065,7 @@ function worthFailoverTo(failure, model, ids) {
     failure.transportFailure === true ||
     // 空完成也值得换：另一个车道/模型多半能正常答，换一个比回空强。
     failure.emptyCompletion === true ||
+    failure.transient === true ||
     (failure.status === 403 && KNOWN_OPENCODE_ONLY.has(model))
 }
 
@@ -1025,7 +1143,7 @@ async function fetchUpstream(lane, model, payload, ids, stream) {
   try {
     return await fetch(`${lane.baseUrl}${endpointFor(lane, model)}`, {
       method: 'POST',
-      headers: gatewayHeaders(lane, ids, stream),
+      headers: gatewayHeaders(lane, { ...ids, stream }),
       body: JSON.stringify(payload),
       signal: controller.signal,
     })

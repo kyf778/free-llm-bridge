@@ -20,6 +20,22 @@ services:
       # 详见 docs/hindsight-setup.md 的「办法 A」。
       HOST: "0.0.0.0"
       UPSTREAM_BASE: "https://opencode.ai"
+      # ── 多车道（可选）─────────────────────────────────────────────
+      # 配了 LANES 就不再自动带内置的免密车道，需要它就一起写进去。
+      # 下面是「OpenCode Zen + Kilo AI」两条**都不需要 key**的车道；完整字段
+      # 说明与实测排序见 README「多车道」一节。
+      #
+      # LANES: >-
+      #   [{"name":"zen","baseUrl":"https://opencode.ai","model":"space-bunny-free",
+      #     "headers":{"user-agent":"opencode/1.18.31","x-opencode-client":"desktop"},
+      #     "fingerprintTools":true,"sessionScoped":true,"normalizeSchema":true,"strictSchema":true},
+      #    {"name":"kilo","baseUrl":"https://api.kilo.ai/api/gateway",
+      #     "model":"liquid/lfm-2.5-2.6b:free","knownFree":true,"keyless":true,
+      #     "pathStyle":"openai",
+      #     "knownFreeModels":["liquid/lfm-2.5-2.6b:free",
+      #       "nvidia/nemotron-3-super-120b-a12b:free","kilo-auto/free",
+      #       "cohere/north-mini-code:free","dots-studio/dots-3-note-preview:free"]}]
+      # MAX_THROTTLE_SEC: "1800"   # 限流冷却上限（默认 21600=6h，实测上游会给到 9h+）
     ports:
       # 只发布到回环。NAS 上的容器用 host.docker.internal 或局域网 IP 访问，
       # 不需要把 18999 发布到公网。

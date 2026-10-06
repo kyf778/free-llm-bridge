@@ -31,12 +31,14 @@
 > 旧拓扑的教训仍然成立——**跨机器时 `host.docker.internal` 是错的**（它指向
 > Hindsight 所在那台机器的宿主机）；详见文末「备选：桥跑在电脑上」。
 
-**Hindsight compose 里的关键三行**（完整见下文"改之后"样例）：
+**Hindsight compose 里的关键几行**（完整见下文"改之后"样例）：
 
 ```yaml
       - HINDSIGHT_API_LLM_BASE_URL=http://free-llm-bridge:18999/v1   # 服务名直连
-      - HINDSIGHT_API_DATABASE_URL=pg0://hindsight                    # ⚠️ 必须显式，见排错 FAQ 第一条
+      # ⚠️ 下面两件事必须成对出现，缺一会踩启动死循环（见排错 FAQ 第一条）
+      - HINDSIGHT_API_DATABASE_URL=postgresql://hindsight:hindsight@127.0.0.1:5432/hindsight
       - HINDSIGHT_API_LLM_TIMEOUT=600
+    entrypoint: ["/bin/bash", "/app/start-hindsight.sh"]
 ```
 
 ## 第一步：把桥跑起来（容器化形态）
@@ -174,41 +176,52 @@ environment:
 ### 改之后（零成本）
 
 ```yaml
-environment:
-  # ── 4 个环节统一指向桥 ──────────────────────────────────────
-  # 桥容器化在同一个 compose 里时用服务名直连；
-  # 桥跑在别的机器上时这里要换成那台机器的局域网 IP（见「备选」一节）
-  HINDSIGHT_API_LLM_PROVIDER: openai
-  HINDSIGHT_API_LLM_BASE_URL: http://free-llm-bridge:18999/v1
-  HINDSIGHT_API_LLM_API_KEY: local
-  HINDSIGHT_API_LLM_MODEL: space-bunny-free
+  hindsight:
+    # ── ⚠️ 内嵌 postgres 必须有人负责启动：入口包装 + 显式 URL，缺一不可 ──
+    # ① 入口包装：启动 postgres、轮询到 running:true，再交给官方入口。
+    #    脚本来自本仓库 deploy/start-hindsight.sh。
+    entrypoint: ["/bin/bash", "/app/start-hindsight.sh"]
+    volumes:
+      - hindsight-data:/home/hindsight/.pg0
+      - ./start-hindsight.sh:/app/start-hindsight.sh:ro
 
-  # ── ⚠️ 必须显式写：不写会踩 pg0 启动死循环，见排错 FAQ 第一条 ──
-  HINDSIGHT_API_DATABASE_URL: pg0://hindsight
+    environment:
+      # ── 4 个环节统一指向桥 ──────────────────────────────────────
+      # 桥容器化在同一个 compose 里时用服务名直连；
+      # 桥跑在别的机器上时这里要换成那台机器的局域网 IP（见「备选」一节）
+      HINDSIGHT_API_LLM_PROVIDER: openai
+      HINDSIGHT_API_LLM_BASE_URL: http://free-llm-bridge:18999/v1
+      HINDSIGHT_API_LLM_API_KEY: local
+      HINDSIGHT_API_LLM_MODEL: space-bunny-free
 
-  # ── 思考关不掉就用上限兜：thinking 是米莫方言，实测免费车道回 400 ──
-  HINDSIGHT_API_LLM_EXTRA_BODY: '{"max_tokens":4096}'
+      # ② 显式 postgresql://：让 Hindsight 完全不走 pg0 的探测代码路径。
+      #    注意：单写这行会跳过 postgres 启动（没人启动它）；单写 pg0://
+      #    又会在慢机器上踩返回值 None。两者必须配对，详见排错 FAQ 第一条。
+      HINDSIGHT_API_DATABASE_URL: postgresql://hindsight:hindsight@127.0.0.1:5432/hindsight
 
-  # ── 超时必须放宽：免费车道思考期可能静默 60-70 秒 ─────────────
-  HINDSIGHT_API_LLM_TIMEOUT: 600
-  HINDSIGHT_API_LLM_CONNECT_TIMEOUT: 15
+      # ── 思考关不掉就用上限兜：thinking 是米莫方言，实测免费车道回 400 ──
+      HINDSIGHT_API_LLM_EXTRA_BODY: '{"max_tokens":4096}'
 
-  # ── 桥会自己故障转移，所以重试次数不必高 ─────────────────────
-  HINDSIGHT_API_LLM_MAX_RETRIES: 2
-  HINDSIGHT_API_LLM_INITIAL_BACKOFF: 2.0
-  HINDSIGHT_API_LLM_MAX_BACKOFF: 30.0
+      # ── 超时必须放宽：免费车道思考期可能静默 60-70 秒 ─────────────
+      HINDSIGHT_API_LLM_TIMEOUT: 600
+      HINDSIGHT_API_LLM_CONNECT_TIMEOUT: 15
 
-  # ── 并发压低：免费额度按会话计，并发越高越容易撞限流 ─────────
-  HINDSIGHT_API_LLM_MAX_CONCURRENT: 2
+      # ── 桥会自己故障转移，所以重试次数不必高 ─────────────────────
+      HINDSIGHT_API_LLM_MAX_RETRIES: 2
+      HINDSIGHT_API_LLM_INITIAL_BACKOFF: 2.0
+      HINDSIGHT_API_LLM_MAX_BACKOFF: 30.0
 
-  # ── 慢机器：初始化（模型加载 + 内嵌库）可能超过默认 300 秒看门狗 ──
-  HINDSIGHT_API_STARTUP_WAIT_SECONDS: 900
-  HINDSIGHT_API_MODEL_INIT_TIMEOUT: 900
+      # ── 并发压低：免费额度按会话计，并发越高越容易撞限流 ─────────
+      HINDSIGHT_API_LLM_MAX_CONCURRENT: 2
 
-  # ── 向量化仍然本地跑，不花钱，保持原样 ─────────────────────
-  HINDSIGHT_API_EMBEDDINGS_PROVIDER: huggingface
-  HINDSIGHT_API_RERANKER_PROVIDER: rrf
-  HINDSIGHT_API_RECALL_MAX_CANDIDATES_PER_SOURCE: 30
+      # ── 慢机器：初始化（模型加载 + 内嵌库）可能超过默认 300 秒看门狗 ──
+      HINDSIGHT_API_STARTUP_WAIT_SECONDS: 900
+      HINDSIGHT_API_MODEL_INIT_TIMEOUT: 900
+
+      # ── 向量化仍然本地跑，不花钱，保持原样 ─────────────────────
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: huggingface
+      HINDSIGHT_API_RERANKER_PROVIDER: rrf
+      HINDSIGHT_API_RECALL_MAX_CANDIDATES_PER_SOURCE: 30
 ```
 
 改完重启容器：
@@ -336,33 +349,74 @@ curl -s http://127.0.0.1:18999/health | jq '{throttled, retryInSec, lanes: [.lan
 
 **Q: 重建后容器反复重启，日志报 `ValueError: Database URL is required for migrations`。**
 
-**真解（实测一次生效）：compose 里显式加一行**
+**真解（2026-10-06 复测后修订）：两件事必须成对配，缺一不可。**
 
 ```yaml
-      - HINDSIGHT_API_DATABASE_URL=pg0://hindsight
+  hindsight:
+    # ① 入口包装：负责把 postgres 拉起来并等它就绪
+    entrypoint: ["/bin/bash", "/app/start-hindsight.sh"]
+    volumes:
+      - hindsight-data:/home/hindsight/.pg0
+      - ./start-hindsight.sh:/app/start-hindsight.sh:ro    # 见仓库 deploy/
+    environment:
+      # ② 显式 postgresql://：让 Hindsight 完全不走 pg0 的探测代码路径
+      - HINDSIGHT_API_DATABASE_URL=postgresql://hindsight:hindsight@127.0.0.1:5432/hindsight
 ```
 
-根因（四轮排查 + postgres 日志证据定案）：这是 Hindsight 内嵌 pg0 包装层的
-**返回值 bug**，不是数据库起不来——
+脚本就是 [`deploy/start-hindsight.sh`](../deploy/start-hindsight.sh)，核心是
+**先 `pg0 start`、再轮询 `pg0 info` 直到 `"running": true`，然后才 exec 官方入口**。
+
+### 根因（实测证据）
 
 - postgres 每轮日志都是 `ready to accept connections`（7 轮全中，无端口冲突、
   无权限、无磁盘、无 OOM——磁盘剩 330G、OOMKilled=false 都实测排除过）
 - pg0 的探测在库 ready **之后 6 秒**执行，拿到的仍是 `None`：
   `PostgreSQL started: None → db_url=None → ValueError → API 退出 → 重启循环`
-- `instance.json` 每轮正确写入 pid/port，证明启动子流程成功、只有返回值算坏了
-  （`port=auto` 与实际 `5432` 的换算可疑）
+这是 Hindsight 侧 pg0 包装层的**返回值 bug**，不是数据库起不来——postgres 每轮日志
+都是 `ready to accept connections`（磁盘剩 330G、`OOMKilled=false` 都排除过）。
+问题出在 `hindsight_api/pg0.py`：
 
-显式写 `pg0://hindsight` 后，URL 来自配置而不再依赖 `start()` 的返回值——
-日志随即变成 `PostgreSQL started: postgresql://hindsight:...`，循环打破
-（实测 7 分钟内 healthy，此后零重启）。
+```python
+info = await loop.run_in_executor(None, pg0.start)   # 子进程返回
+uri  = info.uri                                      # 紧接着再查一次 pg0 info
+return uri                                           # 不检查 None、不重试
+```
+
+`info.uri` 来自 `pg0 info -o json`。慢机器上这次查询可能还没看到 `running:true`，
+于是 `uri=None → db_url=None → ValueError → API 退出 → 重启循环`。
+
+### ⚠️ 两处此前的错误结论，已更正
+
+**（一）「显式写 `pg0://hindsight` 就能根治」——不成立。**
+`pg0://hindsight` 走的**正是上面那条会返回 `None` 的代码路径**（`resolve_database_url`
+的 `is_pg0` 分支 → `EmbeddedPostgres.ensure_running()`）。2026-10-06 复测仍在
+`PostgreSQL started: None` 上崩溃：它的 URL 并没有"来自配置"——`ensure_running()`
+照样调用 `start()` 并读返回值。
+
+**（二）显式 `postgresql://` 单独用，是另一个坑。**
+它能绕过探测 bug，但**同时也跳过了 postgres 的启动**——Hindsight 只去连一个
+"应该已经存在"的库。于是**没有任何人负责启动 postgres**：容器重建（或 NAS 重启、
+断电）后 postgres 一并消失，报 `Connection refused`，而 pg0 那条路又没走，
+死循环照旧。**此前"稳定 25 小时"只是因为期间没重启过容器。**
+
+所以正确形态是**两者配对**：显式 URL 绕开探测 bug，入口包装补上启动责任。
 
 > ⚠️ **以下老办法已被实测证伪，别浪费时间**：
 > - `docker restart hindsight` —— 重启多少次都复发；
-> - 删 `data/postmaster.pid` 再重启 —— 锁清干净了签名照旧（`Instance already running`
->   消失但 `started: None` 回来）；锁不是根因。
+> - 删 `data/postmaster.pid` 再重启 —— 锁清干净了签名照旧；锁不是根因。
+> - 手工 `pg_ctl start` 救活一次 —— 只对当前容器有效，下次重建照旧复发。
 >
 > 另注：`PostgreSQL started: None` 是**容器重建后发作**、与 LLM 配置正交
 > （每轮重启 LLM 验证都先通过再死在库上），所以**回滚 BASE_URL 治不了它**。
+
+### 验证方式
+
+```bash
+docker restart hindsight          # 模拟 NAS 重启/断电恢复
+# 期望：日志出现 [start-hindsight] postgres ready after Ns
+#      约 2 分钟内 /health 返回 {"status":"healthy","database":"connected"}
+#      且 docker inspect 的 RestartCount 保持 0（没有进入崩溃循环）
+```
 
 **Q: 日志偶发 `OutputTooLongError: LLM output exceeded token limits (scope=consolidation)`。**
 非阻塞。免费档的输出上限比 mimo 小，整合环节偶尔一次超限，Hindsight 自己会提示
