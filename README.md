@@ -1,5 +1,7 @@
 # free-llm-bridge
 
+[English](./README.en.md) | **简体中文**
+
 [![CI](https://github.com/kyf778/free-llm-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/kyf778/free-llm-bridge/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
