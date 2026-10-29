@@ -119,6 +119,12 @@ const LANES = JSON.stringify([
     name: 'primary',
     baseUrl: `http://127.0.0.1:${PRIMARY_PORT}`,
     model: 'primary-model-free',
+    // 2026-10-29: 显式声明本车道的候选池。
+    // 桥已改成「逐车道探测 {baseUrl}/models」，探测失败时不再借用代码里写死的
+    // FALLBACK_ORDER（那是 OpenCode 的旧模型名，在 Kilo 网关上 404）。
+    // 候选池完全来自 model + knownFreeModels；不配的话这条车道只有 1 个候选，
+    // 剧本 2「同车道内换一个模型再跨车道」就永远测不到，会被误判成代码回归。
+    knownFreeModels: FALLBACK_ORDER,
     headers: { 'user-agent': 'opencode/1.18.31', 'x-opencode-client': 'desktop' },
     fingerprintTools: true,
     sessionScoped: true,
