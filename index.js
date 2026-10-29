@@ -267,9 +267,16 @@ export { FALLBACK_ORDER }
  * 额度有限且有期限，绝不能当主力。它只作为独立车道排在所有免费车道之后。
  */
 const QUEUE_ORDER = [
+  // 2026-10-29: CodeBuddy 车道（经 codebuddy-bridge）提到第一位。
+  // 原因：hindsight 的 consolidation 要吐 ~4.6k output token，免费模型
+  // 单次要 90s 上下；deepseek-v4.1-flash 实测 2.1s 返回、输出吞吐快一个量级。
+  // 代价：每次调用消耗 CodeBuddy 积分（x0.11 倍率），小号余额 + 每日签到
+  // 可覆盖。若 CodeBuddy 进冷却，自动落到下一位的免费模型，不需人工干预。
+  'deepseek-v4.1-flash',
+  'cohere/north-mini-code:free',   // 2026-10-26: 实测 1.0s，Kilo 免费池当前最稳
+  'openrouter/free',   // 2026-10-26: 实测 200，自动挑可用免费模型
   // —— 1. 直连可用且能关思考（实测最快）——
   'nvidia/nemotron-3-super-120b-a12b:free',   // 1433ms，关思考 rt=0
-  'cohere/north-mini-code:free',              // 7977ms → 关思考 919ms
   'nemotron-3.5-lightning-free',              // 7362ms → 关思考 1381ms
   'nemotron-3-ultra-free',                    // 9624ms，关思考 rt=0
   // —— 2. 直连可用但思考关不干净（仍比限流档快）——
@@ -1675,31 +1682,72 @@ function listen() {
 }
 
 /**
- * 启动时探一次主车道的模型清单。探不到就退回内置顺序，不阻塞服务可用。
+ * 启动时探每条车道的模型清单，筛出免费档。
  *
- * 只探主车道：备用车道通常就一个已知模型，为它花一次请求不值当。
+ * 2026-10-26 改：原来只探主车道，且把路径写死成 `/zen/v1/models`——换掉
+ * 主车道、或上游改了路径，就永远探不到，模型名只能吃配置里那份写死的清单。
+ * Kilo 免费池换血后整条车道 404（首选的
+ * `nvidia/nemotron-3-super-120b-a12b:free` 被下游下线）正是这么来的。
+ *
+ * 现在每条车道各拉自己的 `{baseUrl}/models`，把 `isFree` 的 id 并进该车道的
+ * knownFreeModels：配置里原有的、这次仍在上游清单里的排在前面（保住人工挑好的
+ * 首选顺序），新出现的追加在后。探不到就保留配置值，不阻塞服务可用。
  */
 async function refreshModels() {
-  const session = ensureSession('__probe__')
-  const requestId = requestIdFor(session, 'probe')
-  let rows = []
-  try {
-    const response = await fetch(`${PRIMARY_LANE.baseUrl}/zen/v1/models`, {
-      method: 'GET',
-      headers: gatewayHeaders(PRIMARY_LANE, { session, requestId, stream: false }),
-      signal: AbortSignal.timeout(20000),
-    })
-    if (response.ok) {
-      const payload = await response.json().catch(() => null)
-      rows = Array.isArray(payload?.data) ? payload.data.map(row => row.id).filter(Boolean) : []
+  for (const lane of LANES) {
+    const base = String(lane.baseUrl ?? '').replace(/\/+$/, '')
+    if (base === '') continue
+    const configured = [lane.model, ...(Array.isArray(lane.knownFreeModels) ? lane.knownFreeModels : [])]
+    let ids = []
+    try {
+      const session = ensureSession('__probe__')
+      const requestId = requestIdFor(session, 'probe')
+      const response = await fetch(`${base}/models`, {
+        method: 'GET',
+        headers: gatewayHeaders(lane, { session, requestId, stream: false }),
+        signal: AbortSignal.timeout(20000),
+      })
+      if (response.ok) {
+        const payload = await response.json().catch(() => null)
+        const rows = Array.isArray(payload?.data) ? payload.data : Array.isArray(payload) ? payload : []
+        for (const row of rows) {
+          const id = typeof row === 'string' ? row : row?.id
+          if (typeof id !== 'string' || id === '') continue
+          const declaredFree = row !== null && typeof row === 'object' &&
+            (row.isFree === true || row.is_free === true)
+          // 有的网关不给 isFree 字段，退回「名字像免费」的旧判定。
+          if (declaredFree || isFreeModel(id)) ids.push(id)
+        }
+      }
+    } catch {
+      ids = []
     }
-  } catch {
-    rows = []
+    if (ids.length === 0) {
+      log(`lane "${lane.name}": no free models discovered; keeping the configured list`)
+      // 探测失败时主车道的候选池来自 availableModels；留空会让它回退到代码里
+      // 写死的 FALLBACK_ORDER——那是 OpenCode 的旧模型名，在 Kilo 网关上根本
+      // 不存在（403/404）。这里把配置清单灌进去，保证候选池始终是本车道真实
+      // 提供过的模型名。
+      if (lane === PRIMARY_LANE && availableModels.length === 0) {
+        const fallback = [lane.model, ...(Array.isArray(lane.knownFreeModels) ? lane.knownFreeModels : [])]
+        for (const model of fallback) {
+          if (typeof model === 'string' && model !== '' && !availableModels.includes(model)) {
+            availableModels.push(model)
+          }
+        }
+        log(`lane "${lane.name}": using configured list as fallback (${availableModels.length} models)`)
+      }
+      continue
+    }
+    const keep = configured.filter(id => ids.includes(id))
+    const merged = [...new Set([...keep, ...ids])]
+    lane.knownFreeModels = merged
+    if (lane === PRIMARY_LANE) {
+      availableModels.length = 0
+      availableModels.push(...merged)
+    }
+    log(`lane "${lane.name}": discovered ${ids.length} free models (${merged.length} after merge)`)
   }
-  availableModels.length = 0
-  availableModels.push(...rows)
-  if (rows.length > 0) log(`probed ${rows.length} models on lane "${PRIMARY_LANE.name}"`)
-  else log('lane probe returned nothing; using the built-in candidate order')
 }
 
 /**
